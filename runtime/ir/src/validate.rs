@@ -26,6 +26,7 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_reachability(ir)?;
     validate_refs(ir)?;
     validate_agent_tool_dispatch(ir)?;
+    validate_condition_expressions(ir)?;
     Ok(())
 }
 
@@ -75,6 +76,30 @@ pub fn validate_agent_tool_dispatch(ir: &WorkflowIr) -> IrResult<()> {
         {
             if is_adk_dispatch_coordinates(module, function) && !agent_tool_dispatch {
                 return Err(IrError::UnmarkedAgentToolDispatch(id.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every condition branch expression must be one the runtime's evaluator can
+/// satisfy: a `state.<path>` reference, optionally compared with `==` or `!=`
+/// to a JSON literal. Anything else evaluates false forever at runtime, so it
+/// is refused here, at the one moment the author is listening.
+pub fn validate_condition_expressions(ir: &WorkflowIr) -> IrResult<()> {
+    use jamjet_core::node::NodeKind;
+    for (id, node) in &ir.nodes {
+        if let NodeKind::Condition { branches } = &node.kind {
+            for branch in branches {
+                if let Some(expr) = &branch.condition {
+                    if let Err(reason) = jamjet_core::validate_expression(expr) {
+                        return Err(IrError::InvalidConditionExpression {
+                            node: id.clone(),
+                            expr: expr.clone(),
+                            reason,
+                        });
+                    }
+                }
             }
         }
     }

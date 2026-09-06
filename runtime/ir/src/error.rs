@@ -20,6 +20,13 @@ pub enum IrError {
     #[error("edge from '{from}' to '{to}': target node does not exist")]
     UnknownEdgeTarget { from: String, to: String },
 
+    #[error("condition node '{node}' branch expression `{expr}` is invalid: {reason}")]
+    InvalidConditionExpression {
+        node: String,
+        expr: String,
+        reason: String,
+    },
+
     #[error("condition node '{node}' branch targets unknown node '{target}'")]
     UnknownBranchTarget { node: String, target: String },
 

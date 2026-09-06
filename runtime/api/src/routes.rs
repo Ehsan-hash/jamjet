@@ -188,6 +188,10 @@ async fn create_workflow(
     // version skew loud at the one moment the operator can act on it.
     jamjet_ir::validate_agent_tool_dispatch(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // A branch expression the evaluator cannot satisfy would register fine and
+    // then evaluate false forever, with only a WARN in the engine log to say so.
+    jamjet_ir::validate_condition_expressions(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
     let def = WorkflowDefinition {
@@ -270,18 +274,41 @@ async fn start_execution(
     );
     backend.append_event(event).await?;
 
-    // Immediately enqueue the start node as a work item, routed to the queue its
-    // kind requires (e.g. a Model start node -> the "model" queue), mirroring the
-    // scheduler's logic for chained nodes.
-    let queue_type = def
-        .ir
-        .get("nodes")
-        .and_then(|nodes| nodes.get(&start_node))
-        .and_then(|node| node.get("kind"))
-        .and_then(|kind| serde_json::from_value::<jamjet_core::node::NodeKind>(kind.clone()).ok())
-        .and_then(|k| serde_json::to_value(k.queue_type()).ok())
+    // Immediately enqueue the start node as a work item, built by the same
+    // payload builder the scheduler uses for every later node. Until 2026-09-06
+    // this carried only the two workflow fields, so a `python_fn` start node
+    // had no `module`/`function`/`input` and failed three times.
+    let ir: jamjet_ir::WorkflowIr = serde_json::from_value(def.ir.clone()).map_err(|e| {
+        ApiError::Internal(format!(
+            "stored IR for workflow {} v{} is not loadable: {e}",
+            body.workflow_id, version
+        ))
+    })?;
+    let start_def = ir.nodes.get(&start_node).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "workflow {} v{} names start node '{}' which does not exist",
+            body.workflow_id, version, start_node
+        ))
+    })?;
+    let queue_type = serde_json::to_value(start_def.kind.queue_type())
+        .ok()
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "general".to_string());
+    let initial_state = input.as_object().cloned().unwrap_or_default();
+    let payload = jamjet_scheduler::build_work_item_payload(
+        &ir,
+        &start_node,
+        start_def,
+        &initial_state,
+        &body.workflow_id,
+        &version,
+    );
+    let max_attempts: u32 = match start_def.retry_policy.as_deref() {
+        Some("no_retry") => 1,
+        Some("io_default") => 5,
+        Some("llm_default") => 3,
+        _ => 3,
+    };
     let sched_event = jamjet_state::Event::new(
         execution_id.clone(),
         2,
@@ -297,12 +324,9 @@ async fn start_execution(
         execution_id: execution_id.clone(),
         node_id: start_node,
         queue_type,
-        payload: json!({
-            "workflow_id": body.workflow_id,
-            "workflow_version": version,
-        }),
+        payload,
         attempt: 0,
-        max_attempts: 3,
+        max_attempts,
         created_at: now,
         lease_expires_at: None,
         worker_id: None,
@@ -1051,10 +1075,43 @@ async fn claim_work_item(
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
     let queue_refs: Vec<&str> = body.queue_types.iter().map(|s| s.as_str()).collect();
-    let item = backend
-        .claim_work_item(&body.worker_id, &queue_refs)
-        .await?;
-    let Some(wi) = item else {
+    // A cancelled, completed or failed execution can still own pending items:
+    // one re-queued by an expired lease, or the start node of a run cancelled
+    // before any worker polled. Handing those out burns worker time on a run
+    // nobody wants (spike finding G10, 2026-09-06). Settle them as failed with
+    // the reason and keep claiming, bounded so a queue of dead items cannot pin
+    // the request.
+    let mut claimed = None;
+    for _ in 0..16 {
+        let Some(candidate) = backend
+            .claim_work_item(&body.worker_id, &queue_refs)
+            .await?
+        else {
+            break;
+        };
+        let terminal_status = match backend.get_execution(&candidate.execution_id).await? {
+            Some(exec) if exec.status.is_terminal() => Some(exec.status),
+            _ => None,
+        };
+        match terminal_status {
+            Some(status) => {
+                warn!(
+                    work_item_id = %candidate.id,
+                    execution_id = %candidate.execution_id,
+                    ?status,
+                    "claim: withholding work of a terminal execution"
+                );
+                backend
+                    .fail_work_item(candidate.id, &format!("execution is {status:?}"))
+                    .await?;
+            }
+            None => {
+                claimed = Some(candidate);
+                break;
+            }
+        }
+    }
+    let Some(wi) = claimed else {
         return Ok(nothing_to_claim());
     };
 
@@ -1532,6 +1589,23 @@ async fn complete_work_item(
             None
         }
     };
+    // A result that arrives after the run reached a terminal state (a cancel
+    // while the step was running, spike finding G10b) must not be recorded:
+    // no event, no state patch. The item is settled so an expiring lease
+    // cannot resurrect it.
+    if let Some(wi) = recorded.as_ref() {
+        if let Some(exec) = backend.get_execution(&wi.execution_id).await? {
+            if exec.status.is_terminal() {
+                let reason = format!("execution is {:?}", exec.status);
+                warn!(work_item_id = %id, execution_id = %wi.execution_id, "complete: refused, {reason}");
+                backend.fail_work_item(item_id, &reason).await?;
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({ "completed": false, "reason": reason })),
+                ));
+            }
+        }
+    }
     let derived_key: Option<String> = match &recorded {
         Some(wi) => {
             jamjet_state::derive_idempotency_key(backend.as_ref(), &wi.execution_id, &wi.node_id)
@@ -1803,6 +1877,20 @@ async fn fail_work_item(
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
+    // Same rule as `complete`: nothing is recorded against a terminal run.
+    if let Ok(Some(wi)) = backend.get_work_item(item_id).await {
+        if let Some(exec) = backend.get_execution(&wi.execution_id).await? {
+            if exec.status.is_terminal() {
+                let reason = format!("execution is {:?}", exec.status);
+                warn!(work_item_id = %id, execution_id = %wi.execution_id, "fail: refused, {reason}");
+                backend.fail_work_item(item_id, &reason).await?;
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({ "failed": false, "work_item_id": id, "reason": reason })),
+                ));
+            }
+        }
+    }
 
     let Some(fence) = body.lease_fence else {
         // Legacy unfenced path, deprecated. Preserved verbatim so existing

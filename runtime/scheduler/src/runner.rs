@@ -426,138 +426,16 @@ impl Scheduler {
                     _ => 3,
                 };
 
-                // Build the base payload that every work item carries.
-                let mut payload = serde_json::json!({
-                    "workflow_id": workflow_id,
-                    "workflow_version": workflow_version,
-                    "node_id": node_id,
-                });
-                // For PythonFn nodes, enrich the payload so the external Python
-                // worker is self-contained: it needs the module, the function to
-                // invoke, and the current workflow state as the call input.
-                // `progress.final_state` is the accumulated state (all
-                // `state_patch`es from completed nodes so far) and is available
-                // here without an additional backend call.
-                if let NodeKind::PythonFn {
-                    module, function, ..
-                } = &node.kind
-                {
-                    let obj = payload
-                        .as_object_mut()
-                        .expect("payload is always a JSON object");
-                    obj.insert("module".into(), serde_json::Value::String(module.clone()));
-                    obj.insert(
-                        "function".into(),
-                        serde_json::Value::String(function.clone()),
-                    );
-                    obj.insert(
-                        "input".into(),
-                        serde_json::Value::Object(progress.final_state.clone()),
-                    );
-                }
-
-                // For JavaFn nodes, enrich the payload so the external Java
-                // tool-worker is self-contained — exactly mirroring the PythonFn
-                // arm above, bar the language-appropriate dispatch coordinates:
-                // it needs the class to reflect, the method to invoke, and the
-                // current workflow state as the call input. The Java worker
-                // claims these `java_tool` items over the same HTTP claim/complete
-                // API the Python worker uses, so the contract is identical.
-                if let NodeKind::JavaFn {
-                    class_name, method, ..
-                } = &node.kind
-                {
-                    let obj = payload
-                        .as_object_mut()
-                        .expect("payload is always a JSON object");
-                    obj.insert(
-                        "class".into(),
-                        serde_json::Value::String(class_name.clone()),
-                    );
-                    obj.insert("method".into(), serde_json::Value::String(method.clone()));
-                    obj.insert(
-                        "input".into(),
-                        serde_json::Value::Object(progress.final_state.clone()),
-                    );
-                }
-
-                // For Model nodes, enrich the payload with model configuration and tool
-                // schemas so the model worker is self-contained.
-                if let NodeKind::Model {
-                    model_ref,
-                    system_prompt,
-                    tools,
-                    ..
-                } = &node.kind
-                {
-                    let obj = payload
-                        .as_object_mut()
-                        .expect("payload is always a JSON object");
-                    // Resolve model identifier from the IR's named models map.
-                    let model_id = ir
-                        .models
-                        .get(model_ref.as_str())
-                        .map(|cfg| {
-                            if cfg.provider.is_empty() {
-                                cfg.model.clone()
-                            } else {
-                                format!("{}/{}", cfg.provider, cfg.model)
-                            }
-                        })
-                        .unwrap_or_else(|| model_ref.clone());
-                    obj.insert("model".into(), serde_json::Value::String(model_id));
-                    // Optional model config overrides.
-                    if let Some(cfg) = ir.models.get(model_ref.as_str()) {
-                        if let Some(temp) = cfg.temperature {
-                            obj.insert("temperature".into(), serde_json::json!(temp));
-                        }
-                        if let Some(mt) = cfg.max_tokens {
-                            obj.insert("max_tokens".into(), serde_json::json!(mt));
-                        }
-                    }
-                    // Node-level system prompt.
-                    if let Some(sp) = system_prompt {
-                        obj.insert(
-                            "system_prompt".into(),
-                            serde_json::Value::String(sp.clone()),
-                        );
-                    }
-                    // Tool schemas — passed to the model so it can emit tool_calls.
-                    if !tools.is_empty() {
-                        obj.insert("tools".into(), serde_json::Value::Array(tools.clone()));
-                    }
-                    // Running conversation history — thread the accumulated
-                    // `messages` from state into the payload so each turn's model
-                    // call sees the full history (the agent loop accumulates them
-                    // in `state["messages"]`; the executor builds its ChatMessage
-                    // list from this when the node carries no inline `prompt`).
-                    // Without this the loop cannot feed tool results forward.
-                    if let Some(messages) = progress.final_state.get("messages") {
-                        obj.insert("messages".into(), messages.clone());
-                    }
-                }
-
-                // For Condition nodes, enrich the payload with the branch list
-                // and the current workflow state so the condition executor is
-                // self-contained.  The executor evaluates each branch's expression
-                // against `state` and records the routing decision on NodeCompleted.
-                // `progress.final_state` is the accumulated state from all
-                // completed nodes so far — exactly what the condition gate reads.
-                if let NodeKind::Condition { branches } = &node.kind {
-                    if !branches.is_empty() {
-                        let obj = payload
-                            .as_object_mut()
-                            .expect("payload is always a JSON object");
-                        obj.insert(
-                            "branches".into(),
-                            serde_json::to_value(branches).unwrap_or(serde_json::json!([])),
-                        );
-                        obj.insert(
-                            "state".into(),
-                            serde_json::Value::Object(progress.final_state.clone()),
-                        );
-                    }
-                }
+                // One builder for every node, shared with `POST /executions` so
+                // the start node carries the same enrichment as every later one.
+                let payload = crate::payload::build_work_item_payload(
+                    &ir,
+                    node_id,
+                    node,
+                    &progress.final_state,
+                    workflow_id,
+                    workflow_version,
+                );
 
                 let item = WorkItem {
                     id: Uuid::new_v4(),
