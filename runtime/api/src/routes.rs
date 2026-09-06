@@ -2013,7 +2013,22 @@ async fn heartbeat_work_item(
     backend
         .renew_lease(item_id, &body.worker_id, body.lease_fence)
         .await?;
-    Ok(Json(json!({ "renewed": true, "work_item_id": id })))
+    // The heartbeat is the one channel every external worker already polls,
+    // so it carries the cancel signal (spike finding G10, 2026-09-06). The
+    // worker abandons the step; the claim route settles the item once its
+    // lease lapses.
+    let cancel_requested = match backend.get_work_item(item_id).await? {
+        Some(wi) => backend
+            .get_execution(&wi.execution_id)
+            .await?
+            .is_some_and(|exec| exec.status.is_terminal()),
+        None => false,
+    };
+    Ok(Json(json!({
+        "renewed": true,
+        "work_item_id": id,
+        "cancel_requested": cancel_requested,
+    })))
 }
 
 // ── Coordinator decisions ────────────────────────────────────────────────────

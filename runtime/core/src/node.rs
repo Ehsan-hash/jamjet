@@ -82,6 +82,18 @@ pub enum NodeKind {
         agent_tool_dispatch: bool,
     },
 
+    /// A step run by an external worker of any language, claimed from the
+    /// queue the node names over the same HTTP claim/heartbeat/complete API
+    /// the Python and Java workers use. The worker resolves `handler` itself.
+    ///
+    /// Until 2026-09-06 the queue was derived from the node kind, so only a
+    /// Python or a Java worker had anything to claim (PAS spike finding G1).
+    ExternalFn {
+        queue: String,
+        handler: String,
+        output_schema: String,
+    },
+
     /// Router — evaluates expressions and branches.
     Condition { branches: Vec<ConditionalBranch> },
 
@@ -233,6 +245,7 @@ impl NodeKind {
             Self::Tool { .. } | Self::Finalizer { .. } => QueueType::Tool,
             Self::PythonFn { .. } => QueueType::PythonTool,
             Self::JavaFn { .. } => QueueType::JavaTool,
+            Self::ExternalFn { queue, .. } => QueueType::Named(queue.clone()),
             Self::MemoryRetrieval { .. } => QueueType::Retrieval,
             Self::McpTool { .. } | Self::A2aTask { .. } => QueueType::Tool,
             Self::Agent { .. } => QueueType::General,
@@ -253,8 +266,12 @@ impl NodeKind {
 }
 
 /// Which queue a node's work item is dispatched to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Serialized as the bare queue name (`"python_tool"`, `"pas-control"`), which
+/// is also what workers send in `queue_types` when they claim. The built-in
+/// names keep their snake_case spelling; anything else is a [`QueueType::Named`]
+/// queue that an `external_fn` node introduced.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueType {
     Model,
     Tool,
@@ -263,6 +280,49 @@ pub enum QueueType {
     Retrieval,
     Privileged,
     General,
+    /// A queue named by an `external_fn` node, drained by an external worker.
+    Named(String),
+}
+
+impl QueueType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Model => "model",
+            Self::Tool => "tool",
+            Self::PythonTool => "python_tool",
+            Self::JavaTool => "java_tool",
+            Self::Retrieval => "retrieval",
+            Self::Privileged => "privileged",
+            Self::General => "general",
+            Self::Named(name) => name,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "model" => Self::Model,
+            "tool" => Self::Tool,
+            "python_tool" => Self::PythonTool,
+            "java_tool" => Self::JavaTool,
+            "retrieval" => Self::Retrieval,
+            "privileged" => Self::Privileged,
+            "general" => Self::General,
+            other => Self::Named(other.to_string()),
+        }
+    }
+}
+
+impl Serialize for QueueType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for QueueType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(Self::from_name(&name))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -554,5 +614,38 @@ mod tests {
         };
         #[allow(deprecated)]
         let _ = node.queue_type();
+    }
+}
+
+#[cfg(test)]
+mod queue_type_tests {
+    use super::*;
+
+    /// Spike finding G1 (2026-09-06): a worker in any language but Python or
+    /// Java had no queue to claim, because the queue was derived from the
+    /// node kind. An `external_fn` node names its queue.
+    #[test]
+    fn external_fn_routes_to_the_queue_it_names() {
+        let kind: NodeKind = serde_json::from_value(serde_json::json!({
+            "type": "external_fn", "queue": "pas-control", "handler": "authorize", "output_schema": ""
+        }))
+        .expect("external_fn deserializes");
+        assert_eq!(kind.queue_type(), QueueType::Named("pas-control".into()));
+        assert_eq!(
+            serde_json::to_value(kind.queue_type()).unwrap(),
+            "pas-control"
+        );
+    }
+
+    #[test]
+    fn known_queue_names_still_serialize_as_before() {
+        assert_eq!(
+            serde_json::to_value(QueueType::PythonTool).unwrap(),
+            "python_tool"
+        );
+        let back: QueueType = serde_json::from_value(serde_json::json!("python_tool")).unwrap();
+        assert_eq!(back, QueueType::PythonTool);
+        let named: QueueType = serde_json::from_value(serde_json::json!("pas-control")).unwrap();
+        assert_eq!(named, QueueType::Named("pas-control".into()));
     }
 }

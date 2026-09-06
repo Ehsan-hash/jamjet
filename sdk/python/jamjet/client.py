@@ -354,17 +354,25 @@ class JamjetClient:
         item_id: str,
         worker_id: str,
         lease_fence: int = 0,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Renew the lease on a claimed work item.
 
         ``lease_fence`` must match the value returned when the item was
         claimed; a stale fence causes the runtime to reject the renewal.
+
+        The answer carries ``cancel_requested`` once the execution has been
+        cancelled; the worker loop acts on it.
         """
         r = await self._client.post(
             f"/work-items/{item_id}/heartbeat",
             json={"worker_id": worker_id, "lease_fence": lease_fence},
         )
         r.raise_for_status()
+        try:
+            body = r.json()
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
 
     # ── Generic helpers (for one-off API paths not covered above) ─────────
 

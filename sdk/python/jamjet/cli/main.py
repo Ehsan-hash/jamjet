@@ -1762,15 +1762,27 @@ async def _worker_loop(
     queues: list[str],
     *,
     once: bool = False,
+    heartbeat_interval_s: float = 10.0,
 ) -> None:
     """Core python_tool worker polling loop, separated for testability.
 
     Claim work items from *queues*, resolve the handler named by
     ``payload["module"]`` / ``payload["function"]``, invoke it with
     ``payload["input"]``, and post complete / fail back to the runtime.
-    Heartbeats are sent every 10 seconds while the handler is running.
+    Heartbeats are sent every ``heartbeat_interval_s`` seconds while the
+    handler is running, from a task on the event loop. A synchronous handler
+    therefore runs in a worker thread (``asyncio.to_thread``), never on the
+    loop: on 2026-09-06 a blocking 50 s handler starved the heartbeat, the
+    30 s lease lapsed, and the step was re-run until it was dead-lettered.
+
+    The engine answers a heartbeat with ``cancel_requested`` once the
+    execution is cancelled. The worker then sets ``cancel_requested`` on the
+    handler's :class:`~jamjet.worker_context.WorkContext`, stops waiting for
+    the result, and reports nothing for the item.
     """
     import importlib as _importlib
+
+    from jamjet.worker_context import WorkContext, reset_current_work, set_current_work
 
     while True:
         try:
@@ -1791,14 +1803,25 @@ async def _worker_loop(
 
             console.print(f"[cyan]Claimed[/cyan] id={item_id} node=[bold]{node_id}[/bold] exec={exec_id}")
 
-            # Keep the lease alive while the handler runs.
+            ctx = WorkContext(item_id=item_id, execution_id=exec_id, node_id=node_id)
+            ctx_token = set_current_work(ctx)
+            handler_task: asyncio.Task[Any] | None = None
+
+            # Keep the lease alive while the handler runs, and stop the handler
+            # when the engine says the execution was cancelled.
             async def _heartbeat_loop() -> None:
                 while True:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(heartbeat_interval_s)
                     try:
-                        await client.heartbeat_work_item(item_id, worker_id, lease_fence)
+                        answer = await client.heartbeat_work_item(item_id, worker_id, lease_fence)
                     except Exception as hb_err:
                         console.print(f"[yellow]Heartbeat error:[/yellow] {hb_err}")
+                        continue
+                    if isinstance(answer, dict) and answer.get("cancel_requested"):
+                        ctx.cancel_requested.set()
+                        if handler_task is not None:
+                            handler_task.cancel()
+                        return
 
             hb_task = asyncio.create_task(_heartbeat_loop())
 
@@ -1821,9 +1844,29 @@ async def _worker_loop(
 
                 _inject_seeds(exec_id)
 
-                result = fn(tool_input)
-                if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-                    result = await result
+                async def _run_handler() -> Any:
+                    # A coroutine function runs on the loop; anything else runs in
+                    # a thread so the heartbeat task keeps the lease alive. The
+                    # thread inherits this context, so `current_work()` works there.
+                    if asyncio.iscoroutinefunction(fn):
+                        return await fn(tool_input)
+                    outcome = await asyncio.to_thread(fn, tool_input)
+                    if asyncio.iscoroutine(outcome) or asyncio.isfuture(outcome):
+                        outcome = await outcome
+                    return outcome
+
+                handler_task = asyncio.create_task(_run_handler())
+                try:
+                    result = await handler_task
+                except asyncio.CancelledError:
+                    if not ctx.cancel_requested.is_set():
+                        raise
+                    console.print(
+                        f"[yellow]Abandoned[/yellow] id={item_id} node=[bold]{node_id}[/bold]: execution cancelled"
+                    )
+                    if once:
+                        return
+                    continue
 
                 duration_ms = int((time.monotonic() - t_start) * 1000)
                 output: Any = result if isinstance(result, dict) else {"result": result}
@@ -1903,6 +1946,7 @@ async def _worker_loop(
                         raise
             finally:
                 hb_task.cancel()
+                reset_current_work(ctx_token)
 
             if once:
                 return

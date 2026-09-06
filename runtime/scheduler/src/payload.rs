@@ -57,6 +57,12 @@ pub fn build_work_item_payload(
             obj.insert("method".into(), Value::String(method.clone()));
             obj.insert("input".into(), Value::Object(state.clone()));
         }
+        // Any external worker: the handler name it resolves itself, and the
+        // state as input. The queue is routing, so it stays off the payload.
+        NodeKind::ExternalFn { handler, .. } => {
+            obj.insert("handler".into(), Value::String(handler.clone()));
+            obj.insert("input".into(), Value::Object(state.clone()));
+        }
         // The model worker needs the resolved model id, optional config
         // overrides, the node's system prompt, the tool schemas the model may
         // call, and the running conversation so each turn sees the history.
@@ -183,6 +189,20 @@ mod tests {
         let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
         assert_eq!(p["branches"][0]["target"], "x");
         assert_eq!(p["state"]["key"], "value");
+    }
+
+    #[test]
+    fn external_fn_carries_handler_and_input() {
+        let ir = ir_with(node(
+            json!({ "type": "external_fn", "queue": "pas-control", "handler": "authorize", "output_schema": "" }),
+        ));
+        let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
+        assert_eq!(p["handler"], "authorize");
+        assert_eq!(p["input"]["key"], "value");
+        assert!(
+            p.get("queue").is_none(),
+            "the queue is routing, not payload"
+        );
     }
 
     #[test]

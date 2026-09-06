@@ -13,6 +13,7 @@ No live runtime is required; a _StubClient records all outbound calls.
 
 from __future__ import annotations
 
+import time as _time
 from typing import Any
 
 import httpx
@@ -454,3 +455,81 @@ async def test_client_sends_a_present_key_even_when_falsy() -> None:
     )
     assert "idempotency_key" in sent, "a present key must be sent, not judged for truthiness"
     assert sent["idempotency_key"] == ""
+
+
+# ── Spike regressions, 2026-09-06 ─────────────────────────────────────────────
+#
+# (f) A synchronous handler (every torch call is one) used to run on the event
+#     loop, so the heartbeat task never ran, the 30 s lease lapsed, and the
+#     step was re-run by the same worker until it was dead-lettered.
+# (g) A cancel never reached a running worker. The heartbeat now carries
+#     `cancel_requested`; the worker exposes it to the handler, stops waiting
+#     for the result, and reports nothing for the abandoned item.
+
+
+def _sleep_sync(input: dict) -> dict:
+    """Blocks the calling thread like a model inference call does."""
+    _time.sleep(0.5)
+    return {"slept": True}
+
+
+def _until_cancelled(input: dict) -> dict:
+    """Runs until the worker signals cancel, as a well-behaved GPU step would."""
+    from jamjet.worker_context import current_work
+
+    ctx = current_work()
+    deadline = _time.monotonic() + 3.0
+    while not ctx.cancel_requested.is_set() and _time.monotonic() < deadline:
+        _time.sleep(0.02)
+    return {"saw_cancel": ctx.cancel_requested.is_set()}
+
+
+_SLEEP_SYNC_ITEM: dict = {
+    "id": "wi-sync",
+    "execution_id": "exec_sync",
+    "node_id": "gpu_step",
+    "queue_type": "python_tool",
+    "payload": {"module": "tests.test_worker", "function": "_sleep_sync", "input": {}},
+    "lease_fence": 7,
+}
+
+_CANCEL_ITEM: dict = {
+    "id": "wi-cancel",
+    "execution_id": "exec_cancel",
+    "node_id": "gpu_step",
+    "queue_type": "python_tool",
+    "payload": {"module": "tests.test_worker", "function": "_until_cancelled", "input": {}},
+    "lease_fence": 8,
+}
+
+
+class _CancellingClient(_StubClient):
+    """Stub whose heartbeat answers as the engine does after a cancel."""
+
+    async def heartbeat_work_item(self, item_id: str, worker_id: str, lease_fence: int = 0) -> dict:
+        self.heartbeat_calls.append({"item_id": item_id, "lease_fence": lease_fence})
+        return {"renewed": True, "cancel_requested": True}
+
+
+async def test_worker_keeps_heartbeating_while_a_sync_handler_blocks() -> None:
+    """(f) Heartbeats must flow while a synchronous handler runs."""
+    stub = _StubClient(claimed_item=_SLEEP_SYNC_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True, heartbeat_interval_s=0.1)
+
+    assert len(stub.heartbeat_calls) >= 2, (
+        f"a 0.5 s sync handler with a 0.1 s heartbeat interval must heartbeat, got {len(stub.heartbeat_calls)}"
+    )
+    assert stub.heartbeat_calls[0]["lease_fence"] == 7
+    assert len(stub.complete_calls) == 1 and stub.complete_calls[0]["output"] == {"slept": True}
+
+
+async def test_worker_abandons_the_item_when_the_heartbeat_reports_cancel() -> None:
+    """(g) On cancel_requested the handler sees the flag and nothing is reported."""
+    stub = _CancellingClient(claimed_item=_CANCEL_ITEM)
+    started = _time.monotonic()
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True, heartbeat_interval_s=0.05)
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 2.0, f"the worker must stop waiting once cancelled, took {elapsed:.2f}s"
+    assert stub.complete_calls == [], "a cancelled item's result must not be reported"
+    assert stub.fail_calls == [], "a cancelled item is not a failure either"
