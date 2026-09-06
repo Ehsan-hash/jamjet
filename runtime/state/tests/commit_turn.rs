@@ -364,6 +364,7 @@ async fn commit_turn_stale_fence_writes_nothing() {
         .unwrap();
 
     // Zombie tries to commit with stale fence and write_snapshot = true.
+    let before = db.get_events(&exec_id).await.unwrap().len();
     let event = Event::new(exec_id.clone(), 0, node_completed_kind("n1"));
 
     let err = db
@@ -379,7 +380,7 @@ async fn commit_turn_stale_fence_writes_nothing() {
     // Zero events written.
     assert_eq!(
         db.get_events(&exec_id).await.unwrap().len(),
-        0,
+        before,
         "stale-fence commit_turn must emit zero events"
     );
 

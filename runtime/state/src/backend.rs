@@ -277,6 +277,38 @@ pub trait StateBackend: Send + Sync {
         lease_fence: i64,
     ) -> BackendResult<()>;
 
+    /// Claim with a lease of `lease_secs` seconds (the backend default, 30 s,
+    /// when `None`), which every renewal honours until the item settles. A
+    /// worker running ten-minute steps asks for a lease it can heartbeat
+    /// comfortably (PAS spike finding G9, 2026-09-06). Backends that do not
+    /// override this ignore the length.
+    async fn claim_work_item_with_lease(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+    ) -> BackendResult<Option<WorkItem>> {
+        let _ = lease_secs;
+        self.claim_work_item(worker_id, queue_types).await
+    }
+
+    /// Renew the lease, or re-attach it when the presented fence was lost only
+    /// to expiry and nobody has claimed the item since, as after an engine
+    /// restart longer than the lease (PAS spike finding G8). The fence in the
+    /// answer is the one the worker must present from now on.
+    async fn heartbeat_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<LeaseRenewal> {
+        self.renew_lease(item_id, worker_id, lease_fence).await?;
+        Ok(LeaseRenewal {
+            lease_fence,
+            reattached: false,
+        })
+    }
+
     /// How many times this node has already completed in this execution.
     ///
     /// The `step` component of a tool-effect idempotency key. The default
@@ -572,6 +604,14 @@ pub struct WorkItem {
     /// Tenant that owns this work item.
     #[serde(default = "default_tenant_string")]
     pub tenant_id: String,
+}
+
+/// What a heartbeat hands back: the fence the worker must present from now
+/// on, and whether the lease had to be re-attached after an expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRenewal {
+    pub lease_fence: i64,
+    pub reattached: bool,
 }
 
 /// Result of reclaiming expired work item leases.

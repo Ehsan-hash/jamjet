@@ -49,6 +49,11 @@ pub struct InMemoryBackend {
     projector_checkpoints: DashMap<(String, String), i64>,
     /// Content-addressed artifact store. Key = (tenant_id, hash).
     artifacts: DashMap<(String, String), (Vec<u8>, Option<String>)>,
+    /// Lease length a worker asked for at claim time, in seconds.
+    lease_secs: DashMap<WorkItemId, u64>,
+    /// Who held an expired lease and with which fence, so a late heartbeat
+    /// from that worker can re-attach instead of losing the work.
+    last_lease: DashMap<WorkItemId, (String, i64)>,
 }
 
 impl InMemoryBackend {
@@ -70,6 +75,8 @@ impl InMemoryBackend {
             proj_approvals: DashMap::new(),
             projector_checkpoints: DashMap::new(),
             artifacts: DashMap::new(),
+            lease_secs: DashMap::new(),
+            last_lease: DashMap::new(),
         }
     }
 
@@ -442,7 +449,48 @@ impl StateBackend for InMemoryBackend {
         worker_id: &str,
         queue_types: &[&str],
     ) -> BackendResult<Option<WorkItem>> {
+        self.claim_work_item_with_lease(worker_id, queue_types, None)
+            .await
+    }
+
+    async fn claim_work_item_with_lease(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+    ) -> BackendResult<Option<WorkItem>> {
+        // The fast reclaim of expired leases, mirroring the SQLite claim path:
+        // re-queue, remember the holder, charge the attempt, record the retry.
+        let now = Utc::now();
+        let mut expired: Vec<WorkItem> = Vec::new();
+        for mut entry in self.work_items.iter_mut() {
+            let item = entry.value_mut();
+            let lapsed = item.lease_expires_at.is_some_and(|t| t < now);
+            if lapsed && item.worker_id.is_some() && item.attempt + 1 < item.max_attempts {
+                expired.push(item.clone());
+                self.last_lease.insert(
+                    item.id,
+                    (item.worker_id.clone().unwrap_or_default(), item.lease_fence),
+                );
+                let next = self
+                    .lease_epochs
+                    .get(&item.id)
+                    .map(|e| *e.value())
+                    .unwrap_or(0)
+                    + 1;
+                self.lease_epochs.insert(item.id, next);
+                item.worker_id = None;
+                item.lease_expires_at = None;
+                item.lease_fence = 0;
+                item.attempt += 1;
+            }
+        }
+        for item in &expired {
+            crate::sqlite::record_lease_expiry(self, item).await?;
+        }
+
         let term = self.store_term.load(Ordering::SeqCst);
+        let lease_len = lease_secs.unwrap_or(crate::sqlite::DEFAULT_LEASE_SECS);
         for mut entry in self.work_items.iter_mut() {
             let item = entry.value_mut();
             if item.worker_id.is_none() && queue_types.contains(&item.queue_type.as_str()) {
@@ -455,8 +503,11 @@ impl StateBackend for InMemoryBackend {
                 self.lease_epochs.insert(item.id, new_epoch);
                 let fence = term * 4_294_967_296_i64 + new_epoch;
                 item.worker_id = Some(worker_id.to_string());
-                item.lease_expires_at = Some(Utc::now() + chrono::Duration::seconds(30));
+                item.lease_expires_at =
+                    Some(Utc::now() + chrono::Duration::seconds(lease_len as i64));
                 item.lease_fence = fence;
+                self.lease_secs.insert(item.id, lease_len);
+                self.last_lease.remove(&item.id);
                 return Ok(Some(item.clone()));
             }
         }
@@ -479,11 +530,74 @@ impl StateBackend for InMemoryBackend {
                 if entry.lease_fence != lease_fence {
                     return Err(StateBackendError::FenceLost(item_id.to_string()));
                 }
-                entry.lease_expires_at = Some(Utc::now() + chrono::Duration::seconds(30));
+                let lease_len = self
+                    .lease_secs
+                    .get(&item_id)
+                    .map(|l| *l.value())
+                    .unwrap_or(crate::sqlite::DEFAULT_LEASE_SECS);
+                entry.lease_expires_at =
+                    Some(Utc::now() + chrono::Duration::seconds(lease_len as i64));
                 Ok(())
             }
             None => Err(StateBackendError::NotFound(item_id.to_string())),
         }
+    }
+
+    async fn heartbeat_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<crate::backend::LeaseRenewal> {
+        match self.renew_lease(item_id, worker_id, lease_fence).await {
+            Ok(()) => {
+                return Ok(crate::backend::LeaseRenewal {
+                    lease_fence,
+                    reattached: false,
+                })
+            }
+            Err(StateBackendError::FenceLost(_)) => {}
+            Err(e) => return Err(e),
+        }
+        // Re-attach only when the item is pending from an expiry, unclaimed,
+        // and the caller is the worker that held it with the fence it held.
+        let held = self.last_lease.get(&item_id).map(|h| h.value().clone());
+        let Some((last_worker, last_fence)) = held else {
+            return Err(StateBackendError::FenceLost(item_id.to_string()));
+        };
+        if last_worker != worker_id || last_fence != lease_fence {
+            return Err(StateBackendError::FenceLost(item_id.to_string()));
+        }
+        let Some(mut entry) = self.work_items.get_mut(&item_id) else {
+            return Err(StateBackendError::NotFound(item_id.to_string()));
+        };
+        if entry.worker_id.is_some() {
+            return Err(StateBackendError::FenceLost(item_id.to_string()));
+        }
+        let term = self.store_term.load(Ordering::SeqCst);
+        let new_epoch = self
+            .lease_epochs
+            .get(&item_id)
+            .map(|e| *e.value())
+            .unwrap_or(0)
+            + 1;
+        self.lease_epochs.insert(item_id, new_epoch);
+        let fence = term * 4_294_967_296_i64 + new_epoch;
+        let lease_len = self
+            .lease_secs
+            .get(&item_id)
+            .map(|l| *l.value())
+            .unwrap_or(crate::sqlite::DEFAULT_LEASE_SECS);
+        entry.worker_id = Some(worker_id.to_string());
+        entry.lease_expires_at = Some(Utc::now() + chrono::Duration::seconds(lease_len as i64));
+        entry.lease_fence = fence;
+        entry.attempt = entry.attempt.saturating_sub(1);
+        drop(entry);
+        self.last_lease.remove(&item_id);
+        Ok(crate::backend::LeaseRenewal {
+            lease_fence: fence,
+            reattached: true,
+        })
     }
 
     async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>> {
@@ -805,6 +919,10 @@ impl StateBackend for InMemoryBackend {
                 if expires < now && item.worker_id.is_some() {
                     item.attempt += 1;
                     if item.attempt < item.max_attempts {
+                        self.last_lease.insert(
+                            item.id,
+                            (item.worker_id.clone().unwrap_or_default(), item.lease_fence),
+                        );
                         item.worker_id = None;
                         item.lease_expires_at = None;
                         // Bump epoch so a re-claim mints a strictly greater fence.

@@ -11,7 +11,10 @@ use crate::backend::{
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
-use crate::sqlite::{map_db_err, parse_datetime, parse_execution_id};
+use crate::sqlite::{
+    expire_stale_leases, lease_secs_for, map_db_err, parse_datetime, parse_execution_id,
+    reattach_lease, DEFAULT_LEASE_SECS,
+};
 use crate::tenant::{Tenant, TenantId, TenantLimits, TenantStatus, DEFAULT_TENANT};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -976,34 +979,25 @@ impl StateBackend for TenantScopedSqliteBackend {
         worker_id: &str,
         queue_types: &[&str],
     ) -> BackendResult<Option<WorkItem>> {
+        self.claim_work_item_with_lease(worker_id, queue_types, None)
+            .await
+    }
+
+    async fn claim_work_item_with_lease(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+    ) -> BackendResult<Option<WorkItem>> {
         if queue_types.is_empty() {
             return Ok(None);
         }
 
+        // Re-queue this tenant's expired leases, recording the retry, before
+        // looking for work.
+        expire_stale_leases(self, &self.pool, Some(&self.tenant_id.0)).await?;
         let now = Utc::now().to_rfc3339();
-        // Expire stale leases for this tenant; bump lease_epoch so a re-claim
-        // mints a strictly greater fence than any zombie worker's stale token.
-        sqlx::query(
-            // `attempt + 1` and the max_attempts bound mirror the untenanted
-            // backend: without the increment a node that reliably kills its
-            // worker is resurrected forever at attempt 0, because this fast path
-            // out-races the reclaim sweep that is the only other place attempts
-            // move. An item whose budget is spent stays 'claimed' with an expired
-            // lease, which is exactly what the sweep selects, so it dead-letters
-            // there WITH the NodeFailed only the sweep's caller emits.
-            "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL, \
-             lease_epoch = lease_epoch + 1, lease_fence = 0, attempt = attempt + 1 \
-             WHERE status = 'claimed' AND lease_expires_at < ? AND tenant_id = ? \
-               AND attempt + 1 < max_attempts",
-        )
-        .bind(&now)
-        .bind(&self.tenant_id.0)
-        .execute(&self.pool)
-        .await
-        .map_err(map_db_err)?;
 
-        // BEGIN IMMEDIATE: see SqliteBackend::append_event — a deferred
-        // SELECT→UPDATE upgrade hits an instant SQLITE_BUSY under concurrency.
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -1035,7 +1029,8 @@ impl StateBackend for TenantScopedSqliteBackend {
 
         let item = row_to_work_item(&row)?;
         let item_id = item.id.to_string();
-        let lease_expires_at = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        let lease_len = lease_secs.unwrap_or(DEFAULT_LEASE_SECS) as i64;
+        let lease_expires_at = (Utc::now() + chrono::Duration::seconds(lease_len)).to_rfc3339();
         let claimed_at = Utc::now().to_rfc3339();
 
         let term = self.current_term(&mut tx).await?;
@@ -1044,13 +1039,14 @@ impl StateBackend for TenantScopedSqliteBackend {
         let new_fence = term * 4_294_967_296_i64 + new_epoch;
 
         sqlx::query(
-            "UPDATE work_items SET status = 'claimed', worker_id = ?, lease_expires_at = ?, claimed_at = ?, lease_epoch = ?, lease_fence = ? WHERE id = ?",
+            "UPDATE work_items SET status = 'claimed', worker_id = ?, lease_expires_at = ?, claimed_at = ?, lease_epoch = ?, lease_fence = ?, lease_secs = ? WHERE id = ?",
         )
         .bind(worker_id)
         .bind(&lease_expires_at)
         .bind(&claimed_at)
         .bind(new_epoch)
         .bind(new_fence)
+        .bind(lease_len)
         .bind(&item_id)
         .execute(&mut *tx)
         .await
@@ -1099,8 +1095,9 @@ impl StateBackend for TenantScopedSqliteBackend {
         worker_id: &str,
         lease_fence: i64,
     ) -> BackendResult<()> {
-        let lease_expires_at = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
         let id_str = item_id.to_string();
+        let lease_len = lease_secs_for(&self.pool, &id_str).await?;
+        let lease_expires_at = (Utc::now() + chrono::Duration::seconds(lease_len)).to_rfc3339();
 
         let rows_affected = sqlx::query(
             "UPDATE work_items SET lease_expires_at = ? WHERE id = ? AND worker_id = ? AND status = 'claimed' AND tenant_id = ? AND lease_fence = ?",
@@ -1119,6 +1116,31 @@ impl StateBackend for TenantScopedSqliteBackend {
             return Err(StateBackendError::FenceLost(id_str));
         }
         Ok(())
+    }
+
+    async fn heartbeat_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<crate::backend::LeaseRenewal> {
+        match self.renew_lease(item_id, worker_id, lease_fence).await {
+            Ok(()) => Ok(crate::backend::LeaseRenewal {
+                lease_fence,
+                reattached: false,
+            }),
+            Err(StateBackendError::FenceLost(_)) => {
+                reattach_lease(
+                    &self.pool,
+                    Some(&self.tenant_id.0),
+                    item_id,
+                    worker_id,
+                    lease_fence,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, item_id = %item_id))]
@@ -1754,7 +1776,8 @@ impl StateBackend for TenantScopedSqliteBackend {
                 // token so the worker that just lost this item cannot park over
                 // the requeued attempt.
                 let rows = sqlx::query(
-                    "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, \
+                    "UPDATE work_items SET status = 'pending', attempt = ?, last_worker_id = worker_id, \
+                     last_lease_fence = lease_fence, worker_id = NULL, lease_expires_at = NULL, \
                      retry_after = ?, lease_epoch = lease_epoch + 1, lease_fence = 0 \
                      WHERE id = ? AND tenant_id = ? AND status = 'claimed'",
                 )

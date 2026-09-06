@@ -533,3 +533,42 @@ async def test_worker_abandons_the_item_when_the_heartbeat_reports_cancel() -> N
     assert elapsed < 2.0, f"the worker must stop waiting once cancelled, took {elapsed:.2f}s"
     assert stub.complete_calls == [], "a cancelled item's result must not be reported"
     assert stub.fail_calls == [], "a cancelled item is not a failure either"
+
+
+# (h) Lease length and re-attach, spike findings G8 and G9 (2026-09-06).
+
+
+class _LeaseRecordingClient(_StubClient):
+    """Records the lease a claim asks for, and answers heartbeats with a new fence
+    the way the engine does after re-attaching an expired lease."""
+
+    def __init__(self, *, claimed_item: dict | None = None, reattach_fence: int | None = None) -> None:
+        super().__init__(claimed_item=claimed_item)
+        self.claim_lease_secs: list[int | None] = []
+        self._reattach_fence = reattach_fence
+
+    async def claim_work_item(
+        self, worker_id: str, queue_types: list[str], lease_secs: int | None = None
+    ) -> dict | None:
+        self.claim_lease_secs.append(lease_secs)
+        return self._claimed_item
+
+    async def heartbeat_work_item(self, item_id: str, worker_id: str, lease_fence: int = 0) -> dict:
+        self.heartbeat_calls.append({"item_id": item_id, "lease_fence": lease_fence})
+        if self._reattach_fence is not None:
+            return {"renewed": True, "cancel_requested": False, "lease_fence": self._reattach_fence, "reattached": True}
+        return {"renewed": True, "cancel_requested": False}
+
+
+async def test_worker_asks_for_the_lease_it_was_configured_with() -> None:
+    stub = _LeaseRecordingClient(claimed_item=_ADD_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True, lease_secs=600)
+    assert stub.claim_lease_secs == [600]
+
+
+async def test_worker_completes_with_the_fence_a_reattaching_heartbeat_returned() -> None:
+    item = dict(_SLEEP_SYNC_ITEM, lease_fence=11)
+    stub = _LeaseRecordingClient(claimed_item=item, reattach_fence=12)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True, heartbeat_interval_s=0.1)
+    assert len(stub.heartbeat_calls) >= 1
+    assert stub.complete_calls[0]["lease_fence"] == 12, "after a re-attach the completion must carry the new fence"

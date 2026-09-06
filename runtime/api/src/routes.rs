@@ -1047,7 +1047,18 @@ async fn update_tenant(
 struct ClaimWorkItemRequest {
     worker_id: String,
     queue_types: Vec<String>,
+    /// How long a lease the worker needs, in seconds. Renewals keep it. The
+    /// backend default (30 s) applies when absent; a worker that runs long
+    /// steps asks for what it can heartbeat comfortably.
+    #[serde(default)]
+    lease_secs: Option<u64>,
 }
+
+/// Bounds on a requested lease: long enough to be renewable, short enough
+/// that a dead worker's item is not stranded for hours.
+const MIN_LEASE_SECS: u64 = 5;
+const MAX_LEASE_SECS: u64 = 3600;
+const DEFAULT_LEASE_SECS: u64 = 30;
 
 /// The claim response for "you get nothing".
 ///
@@ -1075,6 +1086,9 @@ async fn claim_work_item(
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
     let queue_refs: Vec<&str> = body.queue_types.iter().map(|s| s.as_str()).collect();
+    let lease_secs = body
+        .lease_secs
+        .map(|s| s.clamp(MIN_LEASE_SECS, MAX_LEASE_SECS));
     // A cancelled, completed or failed execution can still own pending items:
     // one re-queued by an expired lease, or the start node of a run cancelled
     // before any worker polled. Handing those out burns worker time on a run
@@ -1084,7 +1098,7 @@ async fn claim_work_item(
     let mut claimed = None;
     for _ in 0..16 {
         let Some(candidate) = backend
-            .claim_work_item(&body.worker_id, &queue_refs)
+            .claim_work_item_with_lease(&body.worker_id, &queue_refs, lease_secs)
             .await?
         else {
             break;
@@ -1153,6 +1167,8 @@ async fn claim_work_item(
             // The lease fence the external worker echoes on complete so the
             // engine can prove the lease is still held (exactly-once-COMMIT).
             "lease_fence": wi.lease_fence,
+            // The lease length in force, so the worker can pace its heartbeats.
+            "lease_secs": lease_secs.unwrap_or(DEFAULT_LEASE_SECS),
             // Echoed on complete so the result is recorded against it and a
             // re-run replays instead of re-firing the tool.
             "idempotency_key": idem_key,
@@ -2010,9 +2026,22 @@ async fn heartbeat_work_item(
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
-    backend
-        .renew_lease(item_id, &body.worker_id, body.lease_fence)
-        .await?;
+    // Renew, or re-attach after an expiry nobody else claimed (an engine
+    // restart longer than the lease). A lease that is truly lost is a 409 the
+    // worker can act on, not a 500.
+    let renewal = match backend
+        .heartbeat_lease(item_id, &body.worker_id, body.lease_fence)
+        .await
+    {
+        Ok(renewal) => renewal,
+        Err(jamjet_state::StateBackendError::FenceLost(_)) => {
+            return Err(ApiError::Conflict(format!(
+                "lease on work item {id} is no longer held by {}",
+                body.worker_id
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
     // The heartbeat is the one channel every external worker already polls,
     // so it carries the cancel signal (spike finding G10, 2026-09-06). The
     // worker abandons the step; the claim route settles the item once its
@@ -2027,6 +2056,8 @@ async fn heartbeat_work_item(
     Ok(Json(json!({
         "renewed": true,
         "work_item_id": id,
+        "lease_fence": renewal.lease_fence,
+        "reattached": renewal.reattached,
         "cancel_requested": cancel_requested,
     })))
 }

@@ -210,6 +210,9 @@ async fn commit_fails_closed_with_stale_fence() {
         .unwrap()
         .unwrap();
 
+    // The reclaim that handed the item to worker B recorded the lost lease;
+    // the zombie's commit must add nothing on top of that.
+    let before = db.get_events(&eid).await.unwrap().len();
     let event = Event::new(eid.clone(), 0, node_completed("n1"));
     let err = db
         .commit_turn(zombie.id, zombie.lease_fence, event, false)
@@ -218,7 +221,7 @@ async fn commit_fails_closed_with_stale_fence() {
     assert!(matches!(err, StateBackendError::FenceLost(_)));
 
     // The zombie's commit emitted NOTHING.
-    assert_eq!(db.get_events(&eid).await.unwrap().len(), 0);
+    assert_eq!(db.get_events(&eid).await.unwrap().len(), before);
 
     std::fs::remove_file(&path).ok();
 }
@@ -293,6 +296,7 @@ async fn fence_survives_lost_tail_failover() {
     // Central assertion: the zombie's term-0 fence is rejected on the promoted
     // store. commit_node_terminal WHERE clause `AND lease_fence = zombie_fence`
     // finds zero rows (current fence is the term-1 value) -> FenceLost.
+    let before = promoted.get_events(&eid).await.unwrap().len();
     let ev = Event::new(eid.clone(), 0, node_completed("n1"));
     let err = promoted
         .commit_turn(zombie_item_id, zombie_fence, ev, false)
@@ -305,7 +309,7 @@ async fn fence_survives_lost_tail_failover() {
     // The zombie commit must have written NOTHING.
     assert_eq!(
         promoted.get_events(&eid).await.unwrap().len(),
-        0,
+        before,
         "zombie must emit zero events"
     );
 
@@ -472,6 +476,7 @@ async fn commit_node_terminal_node_failed_stale_fence_fails_closed() {
         .unwrap();
 
     // Zombie tries to commit a NodeFailed with stale fence F1.
+    let before = db.get_events(&eid).await.unwrap().len();
     let event = Event::new(eid.clone(), 0, node_failed("n1"));
     let err = db
         .commit_turn(zombie.id, zombie.lease_fence, event, false)
@@ -485,7 +490,7 @@ async fn commit_node_terminal_node_failed_stale_fence_fails_closed() {
     // Zero events written — the zombie's NodeFailed must not appear.
     assert_eq!(
         db.get_events(&eid).await.unwrap().len(),
-        0,
+        before,
         "zombie NodeFailed commit must emit zero events"
     );
 

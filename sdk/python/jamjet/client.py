@@ -261,16 +261,19 @@ class JamjetClient:
         self,
         worker_id: str,
         queue_types: list[str],
+        lease_secs: int | None = None,
     ) -> dict[str, Any] | None:
         """Claim the next available work item.
 
-        Returns the work_item dict on success, or ``None`` when the queue is
-        empty (runtime responds with ``{"claimed": false}``).
+        ``lease_secs`` asks the engine for a lease of that length (its default
+        is 30 s); renewals keep it. Returns the work_item dict on success, or
+        ``None`` when the queue is empty (runtime responds with
+        ``{"claimed": false}``).
         """
-        r = await self._client.post(
-            "/work-items/claim",
-            json={"worker_id": worker_id, "queue_types": queue_types},
-        )
+        body: dict[str, Any] = {"worker_id": worker_id, "queue_types": queue_types}
+        if lease_secs is not None:
+            body["lease_secs"] = int(lease_secs)
+        r = await self._client.post("/work-items/claim", json=body)
         r.raise_for_status()
         data = r.json()
         if not data.get("claimed"):
