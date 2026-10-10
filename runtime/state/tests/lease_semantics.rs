@@ -561,3 +561,116 @@ async fn a_lease_lapsing_on_a_terminal_run_records_no_retry_and_settles_the_item
         );
     }
 }
+
+/// I-A (PR #140 re-review) at the backend: ending a run sets the status and
+/// appends the terminal event in one step, a fenced commit after it is
+/// refused, and a second termination records nothing.
+#[tokio::test]
+async fn finishing_a_run_writes_status_and_event_together_and_only_once() {
+    use jamjet_state::{Event, ExecutionFinish, TurnCommit};
+    for (name, backend, _) in backends().await {
+        let (exec, id) = seed(backend.as_ref(), "gpu").await;
+        let held = backend
+            .claim_work_item("w1", &["gpu"])
+            .await
+            .unwrap()
+            .expect("claimable");
+
+        let not_terminal = backend
+            .finish_execution(
+                Event::new(
+                    exec.clone(),
+                    0,
+                    EventKind::WorkflowCancelled { reason: None },
+                ),
+                WorkflowStatus::Running,
+            )
+            .await;
+        assert!(
+            not_terminal.is_err(),
+            "{name}: a non-terminal status must be refused, got {not_terminal:?}"
+        );
+        assert!(
+            backend.get_events(&exec).await.unwrap().is_empty(),
+            "{name}: a refused finish wrote an event"
+        );
+
+        let finished = backend
+            .finish_execution(
+                Event::new(
+                    exec.clone(),
+                    0,
+                    EventKind::WorkflowCancelled { reason: None },
+                ),
+                WorkflowStatus::Cancelled,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(finished, ExecutionFinish::Finished(_)),
+            "{name}: {finished:?}"
+        );
+        let status = backend.get_execution(&exec).await.unwrap().unwrap().status;
+        assert_eq!(status, WorkflowStatus::Cancelled, "{name}");
+
+        let again = backend
+            .finish_execution(
+                Event::new(
+                    exec.clone(),
+                    0,
+                    EventKind::WorkflowCompleted {
+                        final_state: json!({}),
+                    },
+                ),
+                WorkflowStatus::Completed,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            again,
+            ExecutionFinish::AlreadyTerminal(WorkflowStatus::Cancelled),
+            "{name}: a second termination must not overwrite the first"
+        );
+
+        let late = backend
+            .commit_turn_unless_terminal(
+                id,
+                held.lease_fence,
+                Event::new(exec.clone(), 0, node_completed()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            late,
+            TurnCommit::ExecutionTerminal(WorkflowStatus::Cancelled),
+            "{name}"
+        );
+
+        let kinds: Vec<String> = backend
+            .get_events(&exec)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| serde_json::to_value(&e.kind).unwrap()["type"].to_string())
+            .collect();
+        assert_eq!(kinds, vec!["\"workflow_cancelled\""], "{name}");
+        let status = backend.get_execution(&exec).await.unwrap().unwrap().status;
+        assert_eq!(status, WorkflowStatus::Cancelled, "{name}");
+
+        let missing = backend
+            .finish_execution(
+                Event::new(
+                    ExecutionId::new(),
+                    0,
+                    EventKind::WorkflowCancelled { reason: None },
+                ),
+                WorkflowStatus::Cancelled,
+            )
+            .await;
+        assert!(
+            matches!(missing, Err(StateBackendError::NotFound(_))),
+            "{name}: {missing:?}"
+        );
+    }
+}

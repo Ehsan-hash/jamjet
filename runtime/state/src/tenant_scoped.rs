@@ -598,6 +598,15 @@ impl StateBackend for TenantScopedSqliteBackend {
         row.map(|r| row_to_execution(&r)).transpose()
     }
 
+    #[instrument(skip(self, event), fields(tenant = %self.tenant_id, execution_id = %event.execution_id))]
+    async fn finish_execution(
+        &self,
+        event: Event,
+        status: WorkflowStatus,
+    ) -> BackendResult<crate::backend::ExecutionFinish> {
+        crate::sqlite::finish_execution_in(&self.pool, Some(&self.tenant_id.0), event, status).await
+    }
+
     #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %id))]
     async fn update_execution_status(
         &self,

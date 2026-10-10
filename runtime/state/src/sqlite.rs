@@ -669,6 +669,15 @@ impl StateBackend for SqliteBackend {
         row.map(|r| row_to_execution(&r)).transpose()
     }
 
+    #[instrument(skip(self, event), fields(execution_id = %event.execution_id, status = ?status))]
+    async fn finish_execution(
+        &self,
+        event: Event,
+        status: WorkflowStatus,
+    ) -> BackendResult<crate::backend::ExecutionFinish> {
+        finish_execution_in(&self.pool, None, event, status).await
+    }
+
     #[instrument(skip(self), fields(execution_id = %id, status = ?status))]
     async fn update_execution_status(
         &self,
@@ -2296,6 +2305,101 @@ impl StateBackend for SqliteBackend {
 }
 
 pub(crate) use crate::backend::DEFAULT_LEASE_SECS;
+
+/// [`StateBackend::finish_execution`] for both SQLite backends: the terminal
+/// check, the status update and the event insert in one `BEGIN IMMEDIATE`
+/// transaction, so a fenced commit (which reads the status under the same
+/// write lock) sees the run either live with no terminal event or terminal
+/// with it. `tenant_id` scopes the execution and stamps the event row.
+pub(crate) async fn finish_execution_in(
+    pool: &SqlitePool,
+    tenant_id: Option<&str>,
+    event: Event,
+    status: WorkflowStatus,
+) -> BackendResult<crate::backend::ExecutionFinish> {
+    use crate::backend::ExecutionFinish;
+    if !status.is_terminal() {
+        return Err(StateBackendError::Database(format!(
+            "finish_execution requires a terminal status, got {status:?}"
+        )));
+    }
+    let execution_id = execution_id_str(&event.execution_id);
+    let event_id = event.id.to_string();
+    let kind_json = serde_json::to_string(&event.kind)?;
+    let created_at = event.created_at.to_rfc3339();
+    let now = Utc::now().to_rfc3339();
+    let tenant_clause = if tenant_id.is_some() {
+        " AND tenant_id = ?"
+    } else {
+        ""
+    };
+
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+
+    if let Some(prior) = terminal_status_of(&mut tx, tenant_id, &execution_id).await? {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Ok(ExecutionFinish::AlreadyTerminal(prior));
+    }
+
+    let update = format!(
+        "UPDATE workflow_executions SET status = ?, updated_at = ?, \
+         completed_at = COALESCE(completed_at, ?) WHERE execution_id = ?{tenant_clause}"
+    );
+    let mut q = sqlx::query(&update)
+        .bind(status_to_str(&status))
+        .bind(&now)
+        .bind(&now)
+        .bind(&execution_id);
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    if q.execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected()
+        == 0
+    {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Err(StateBackendError::NotFound(execution_id));
+    }
+
+    let seq_row = sqlx::query(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
+    )
+    .bind(&execution_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(map_db_err)?;
+    let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+
+    let insert = match tenant_id {
+        Some(t) => sqlx::query(
+            "INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&event_id)
+        .bind(&execution_id)
+        .bind(sequence)
+        .bind(&kind_json)
+        .bind(&created_at)
+        .bind(t),
+        None => sqlx::query(
+            "INSERT INTO events (id, execution_id, sequence, kind_json, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&event_id)
+        .bind(&execution_id)
+        .bind(sequence)
+        .bind(&kind_json)
+        .bind(&created_at),
+    };
+    insert.execute(&mut *tx).await.map_err(map_db_err)?;
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(ExecutionFinish::Finished(sequence))
+}
 
 /// The execution's status when it is terminal, read on the caller's
 /// connection (inside its transaction), or `None` while it is live or absent.

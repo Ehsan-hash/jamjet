@@ -105,6 +105,14 @@ impl StateBackend for FailingGetEvents {
         self.inner.get_execution(id).await
     }
 
+    async fn finish_execution(
+        &self,
+        event: jamjet_state::Event,
+        status: jamjet_core::workflow::WorkflowStatus,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::ExecutionFinish> {
+        self.inner.finish_execution(event, status).await
+    }
+
     async fn update_execution_status(
         &self,
         id: &ExecutionId,

@@ -2,6 +2,11 @@
 //! committed in a separate step, so a cancel landing between the two still
 //! appended `node_completed` and a state patch after `workflow_cancelled`.
 //! The refusal now lives inside the fenced commit's transaction.
+//!
+//! The cancel itself used to be two writes: `WorkflowCancelled` appended,
+//! then the status set. A fenced commit landing between them still saw
+//! `Running` and recorded `NodeCompleted` after `WorkflowCancelled` (PR #140
+//! re-review, I-A). The cancel is now one write that does both.
 mod support;
 
 use axum::http::StatusCode;
@@ -11,16 +16,66 @@ use jamjet_state::event::EventKind;
 use jamjet_state::Event;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use support::{backends, make_state, post, python_fn_start_ir, register_and_start};
 
 /// A real backend that, once armed, cancels the execution the moment anyone
 /// reads it, and hands the reader the status from BEFORE the cancel. That is
 /// a cancel landing right after the route's read: the read is stale by the
 /// time anything acts on it.
+///
+/// Once `commit_between` is set, it also runs a fenced commit for that item
+/// right after each write a cancel makes, before the next one: the latest
+/// point a `/complete` can land while a cancel is in flight.
 struct CancelAfterRead {
     inner: Arc<dyn StateBackend>,
     armed: AtomicBool,
+    commit_between: Mutex<Option<(uuid::Uuid, i64)>>,
+    between_outcome: Mutex<Option<jamjet_state::backend::BackendResult<jamjet_state::TurnCommit>>>,
+}
+
+impl CancelAfterRead {
+    fn new(inner: Arc<dyn StateBackend>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(false),
+            commit_between: Mutex::new(None),
+            between_outcome: Mutex::new(None),
+        }
+    }
+
+    async fn commit_if_armed(&self, execution_id: &ExecutionId) {
+        let armed = self.commit_between.lock().unwrap().take();
+        if let Some((item_id, fence)) = armed {
+            let outcome = self
+                .inner
+                .commit_turn_unless_terminal(
+                    item_id,
+                    fence,
+                    Event::new(execution_id.clone(), 0, late_completion()),
+                    true,
+                )
+                .await;
+            *self.between_outcome.lock().unwrap() = Some(outcome);
+        }
+    }
+}
+
+fn late_completion() -> EventKind {
+    EventKind::NodeCompleted {
+        node_id: "start".into(),
+        output: json!({"gpu_result": "late"}),
+        state_patch: json!({"gpu_result": "late"}),
+        duration_ms: 1,
+        gen_ai_system: None,
+        gen_ai_model: None,
+        input_tokens: None,
+        output_tokens: None,
+        finish_reason: None,
+        cost_usd: None,
+        provenance: None,
+        idempotency_key: None,
+    }
 }
 
 #[async_trait::async_trait]
@@ -67,12 +122,25 @@ impl StateBackend for CancelAfterRead {
         self.inner.create_execution(execution).await
     }
 
+    async fn finish_execution(
+        &self,
+        event: jamjet_state::Event,
+        status: WorkflowStatus,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::ExecutionFinish> {
+        let execution_id = event.execution_id.clone();
+        let finished = self.inner.finish_execution(event, status).await?;
+        self.commit_if_armed(&execution_id).await;
+        Ok(finished)
+    }
+
     async fn update_execution_status(
         &self,
         id: &ExecutionId,
         status: WorkflowStatus,
     ) -> jamjet_state::backend::BackendResult<()> {
-        self.inner.update_execution_status(id, status).await
+        self.inner.update_execution_status(id, status).await?;
+        self.commit_if_armed(id).await;
+        Ok(())
     }
 
     async fn update_execution_current_state(
@@ -109,7 +177,13 @@ impl StateBackend for CancelAfterRead {
         &self,
         event: Event,
     ) -> jamjet_state::backend::BackendResult<jamjet_state::EventSequence> {
-        self.inner.append_event(event).await
+        let execution_id = event.execution_id.clone();
+        let cancel = matches!(event.kind, EventKind::WorkflowCancelled { .. });
+        let seq = self.inner.append_event(event).await?;
+        if cancel {
+            self.commit_if_armed(&execution_id).await;
+        }
+        Ok(seq)
     }
 
     async fn get_events_since(
@@ -475,10 +549,7 @@ impl StateBackend for CancelAfterRead {
 async fn a_cancel_landing_between_the_read_and_the_commit_records_nothing() {
     for tb in backends().await {
         let name = tb.name();
-        let racy = Arc::new(CancelAfterRead {
-            inner: tb.dyn_backend(),
-            armed: AtomicBool::new(false),
-        });
+        let racy = Arc::new(CancelAfterRead::new(tb.dyn_backend()));
         let backend: Arc<dyn StateBackend> = racy.clone();
         let state = make_state(backend.clone());
         register_and_start(&state, python_fn_start_ir("wf-cancel-race"), json!({})).await;
@@ -521,4 +592,104 @@ async fn a_cancel_landing_between_the_read_and_the_commit_records_nothing() {
         );
         assert_eq!(st, StatusCode::CONFLICT, "{name}: {body}");
     }
+}
+
+/// A tenant-scoped view over its own database, for a tenant other than the
+/// default so the tenant clauses are exercised.
+async fn open_tenant_scoped() -> Arc<dyn StateBackend> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("jamjet_route_{}.db", uuid::Uuid::new_v4().simple()));
+    let url = format!("sqlite://{}", path.display());
+    let raw = jamjet_state::SqliteBackend::open(&url)
+        .await
+        .expect("open test db");
+    let now = chrono::Utc::now();
+    raw.for_tenant(jamjet_state::TenantId::default())
+        .create_tenant(jamjet_state::Tenant {
+            id: jamjet_state::TenantId::from("acme"),
+            name: "Acme".into(),
+            status: jamjet_state::TenantStatus::Active,
+            policy: None,
+            limits: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("register tenant");
+    Arc::new(raw.for_tenant(jamjet_state::TenantId::from("acme")))
+}
+
+/// I-A (PR #140 re-review): the cancel route appended `WorkflowCancelled`
+/// and then set the status in a second write. A fenced commit landing between
+/// the two read `Running` and recorded `NodeCompleted` after the cancel. The
+/// wrapper runs that commit after every write the real cancel route makes, so
+/// whatever the route's ordering, the commit sees the cancel or none of it.
+#[tokio::test]
+async fn a_commit_landing_inside_the_cancel_route_records_nothing() {
+    let mut matrix: Vec<(&'static str, Arc<dyn StateBackend>)> = backends()
+        .await
+        .into_iter()
+        .map(|tb| (tb.name(), tb.dyn_backend()))
+        .collect();
+    matrix.push(("tenant_scoped", open_tenant_scoped().await));
+
+    // Every backend is checked before failing, so a regression names them all.
+    let mut failures = Vec::new();
+    for (name, inner) in matrix {
+        let racy = Arc::new(CancelAfterRead::new(inner));
+        let backend: Arc<dyn StateBackend> = racy.clone();
+        let state = make_state(backend.clone());
+        let exec_id =
+            register_and_start(&state, python_fn_start_ir("wf-cancel-writes"), json!({})).await;
+        let item = backend
+            .claim_work_item("py-worker", &["python_tool"])
+            .await
+            .unwrap()
+            .expect("start node item");
+
+        *racy.commit_between.lock().unwrap() = Some((item.id, item.lease_fence));
+        let (st, body) = post(&state, &format!("/executions/{exec_id}/cancel"), json!({})).await;
+        assert_eq!(st, StatusCode::OK, "{name}: cancel failed: {body}");
+
+        let outcome = racy
+            .between_outcome
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the commit ran inside the cancel");
+        let events = backend.get_events(&item.execution_id).await.unwrap();
+        let kinds: Vec<String> = events
+            .iter()
+            .map(|e| serde_json::to_value(&e.kind).unwrap()["type"].to_string())
+            .collect();
+        let cancelled_at = events
+            .iter()
+            .position(|e| matches!(e.kind, EventKind::WorkflowCancelled { .. }))
+            .expect("the cancel was recorded");
+        if events[cancelled_at..]
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+        {
+            failures.push(format!(
+                "{name}: a completion landed after WorkflowCancelled: {kinds:?}"
+            ));
+        }
+        if !matches!(
+            outcome,
+            Ok(jamjet_state::TurnCommit::ExecutionTerminal(
+                WorkflowStatus::Cancelled
+            ))
+        ) {
+            failures.push(format!(
+                "{name}: the completion was not refused: {outcome:?}"
+            ));
+        }
+        let exec = backend
+            .get_execution(&item.execution_id)
+            .await
+            .unwrap()
+            .expect("execution");
+        assert_eq!(exec.status, WorkflowStatus::Cancelled, "{name}");
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -485,18 +485,24 @@ impl Scheduler {
                 )
             };
 
-            let seq = self.backend.latest_sequence(execution_id).await? + 1;
-            self.backend
-                .append_event(jamjet_state::Event::new(
-                    execution_id.clone(),
-                    seq,
-                    event_kind,
-                ))
-                .await?;
-            info!(execution_id = %execution_id, ?status, "Execution reached terminal state");
-            self.backend
-                .update_execution_status(execution_id, status)
-                .await?;
+            // Event and status in one write (PR #140 re-review, I-A). A run
+            // cancelled since this tick read it keeps its cancel: nothing is
+            // appended after `WorkflowCancelled`.
+            match self
+                .backend
+                .finish_execution(
+                    jamjet_state::Event::new(execution_id.clone(), 0, event_kind),
+                    status.clone(),
+                )
+                .await?
+            {
+                jamjet_state::ExecutionFinish::Finished(_) => {
+                    info!(execution_id = %execution_id, ?status, "Execution reached terminal state");
+                }
+                jamjet_state::ExecutionFinish::AlreadyTerminal(prior) => {
+                    debug!(execution_id = %execution_id, ?prior, "Execution already terminal; nothing to record");
+                }
+            }
             // Execution is terminal; drop its progress so the cache doesn't grow
             // without bound as executions complete.
             self.progress.lock().unwrap().remove(execution_id);

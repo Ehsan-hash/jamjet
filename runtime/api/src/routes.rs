@@ -407,18 +407,29 @@ async fn cancel_execution(
         )));
     }
 
-    let seq = backend.latest_sequence(&execution_id).await? + 1;
+    // One write for the event and the status: a fenced `/complete` checks
+    // the status inside its own transaction, and must never find the run
+    // live after `WorkflowCancelled` is in the log (PR #140 re-review, I-A).
+    // The sequence is assigned by the backend.
     let event = jamjet_state::Event::new(
         execution_id.clone(),
-        seq,
+        0,
         jamjet_state::EventKind::WorkflowCancelled {
             reason: Some("user request".into()),
         },
     );
-    backend.append_event(event).await?;
-    backend
-        .update_execution_status(&execution_id, WorkflowStatus::Cancelled)
-        .await?;
+    match backend
+        .finish_execution(event, WorkflowStatus::Cancelled)
+        .await?
+    {
+        jamjet_state::ExecutionFinish::Finished(_) => {}
+        // Another termination won the race since the read above.
+        jamjet_state::ExecutionFinish::AlreadyTerminal(status) => {
+            return Err(ApiError::BadRequest(format!(
+                "execution {id} is already in terminal state: {status:?}"
+            )));
+        }
+    }
 
     Ok(Json(json!({ "execution_id": id, "status": "cancelled" })))
 }

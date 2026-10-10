@@ -47,6 +47,15 @@
   at construction. Previously `Model(middleware="pii")` iterated the string into
   `['p','i','i']` and failed later with a bare `AttributeError` at the provider boundary.
 
+- **`jamjet worker --lease-secs` rejects values outside 5..3600.** The CLI now fails
+  on a value below 5 or above 3600 instead of sending it and letting the engine clamp it
+  silently to a lease the worker never asked for.
+
+- **`jamjet worker` runs sync `@tool` handlers in a thread.** A plain `def` handler now
+  runs via `asyncio.to_thread`, so a blocking handler no longer stalls the event loop and
+  the lease heartbeat with it. Async handlers run on the loop as before. A sync handler
+  that touches state bound to the loop's thread must now do so thread-safely.
+
 ### Fixed
 
 - **`blocked_tools` is enforced on `agent.run()`.** It was enforced only on the durable

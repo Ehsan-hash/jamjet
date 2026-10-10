@@ -296,26 +296,24 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     ));
                 }
 
-                let seq = backend
-                    .latest_sequence(&eid)
-                    .await
-                    .map_err(|e| format!("{e}"))?
-                    + 1;
+                // Event and status in one write, like the cancel route
+                // (PR #140 re-review, I-A).
                 let event = Event::new(
                     eid.clone(),
-                    seq,
+                    0,
                     EventKind::WorkflowCancelled {
                         reason: Some("cancelled via MCP".into()),
                     },
                 );
-                backend
-                    .append_event(event)
+                if let jamjet_state::ExecutionFinish::AlreadyTerminal(status) = backend
+                    .finish_execution(event, WorkflowStatus::Cancelled)
                     .await
-                    .map_err(|e| format!("{e}"))?;
-                backend
-                    .update_execution_status(&eid, WorkflowStatus::Cancelled)
-                    .await
-                    .map_err(|e| format!("{e}"))?;
+                    .map_err(|e| format!("{e}"))?
+                {
+                    return Err(format!(
+                        "execution {id_str} is already terminal: {status:?}"
+                    ));
+                }
 
                 Ok(vec![McpContent::Text {
                     text: json!({"execution_id": id_str, "status": "cancelled"}).to_string(),

@@ -163,6 +163,38 @@ impl StateBackend for InMemoryBackend {
         }
     }
 
+    async fn finish_execution(
+        &self,
+        mut event: Event,
+        status: WorkflowStatus,
+    ) -> BackendResult<crate::backend::ExecutionFinish> {
+        use crate::backend::ExecutionFinish;
+        if !status.is_terminal() {
+            return Err(StateBackendError::Database(format!(
+                "finish_execution requires a terminal status, got {status:?}"
+            )));
+        }
+        // The execution's entry stays locked while the event is pushed, so a
+        // reader of the status cannot see it terminal without the event, or
+        // live with it.
+        let Some(mut entry) = self.executions.get_mut(&event.execution_id) else {
+            return Err(StateBackendError::NotFound(event.execution_id.to_string()));
+        };
+        if entry.status.is_terminal() {
+            return Ok(ExecutionFinish::AlreadyTerminal(entry.status.clone()));
+        }
+        entry.status = status;
+        entry.updated_at = Utc::now();
+        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        event.sequence = seq;
+        self.events
+            .entry(event.execution_id.clone())
+            .or_default()
+            .push(event);
+        drop(entry);
+        Ok(ExecutionFinish::Finished(seq))
+    }
+
     async fn update_execution_current_state(
         &self,
         id: &ExecutionId,
@@ -1125,5 +1157,74 @@ impl StateBackend for InMemoryBackend {
     async fn update_tenant(&self, tenant: Tenant) -> BackendResult<()> {
         self.tenants.insert(tenant.id.clone(), tenant);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::WorkItem;
+    use uuid::Uuid;
+
+    /// The epoch guard on re-attach, on its own. A claim also clears
+    /// `last_lease`, which hides the guard from every route-level test (PR
+    /// #140 re-review, M-A). Here the stale `last_lease` entry is put back by
+    /// hand, as if a later change dropped that clear: only the epoch check is
+    /// left to stop the zombie taking back an item another worker claimed and
+    /// released.
+    #[tokio::test]
+    async fn the_epoch_guard_alone_refuses_a_reattach_after_a_claim_and_release() {
+        let backend = InMemoryBackend::new();
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            execution_id: ExecutionId::new(),
+            node_id: "gpu_step".into(),
+            queue_type: "gpu".into(),
+            payload: serde_json::json!({}),
+            attempt: 0,
+            max_attempts: 5,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: crate::DEFAULT_TENANT.into(),
+        };
+        let id = backend.enqueue_work_item(item).await.unwrap();
+
+        let zombie = backend
+            .claim_work_item("w1", &["gpu"])
+            .await
+            .unwrap()
+            .expect("claimable");
+        backend.force_lease_expired_for_test(id);
+        // A poll of another queue runs the fast reclaim and claims nothing.
+        assert!(backend
+            .claim_work_item("w9", &["other"])
+            .await
+            .unwrap()
+            .is_none());
+
+        let second = backend
+            .claim_work_item("w2", &["gpu"])
+            .await
+            .unwrap()
+            .expect("re-queued item is claimable");
+        assert!(backend
+            .park_work_item(id, second.lease_fence, "1970-01-01T00:00:00Z", 1)
+            .await
+            .unwrap());
+        // The item is pending again, unclaimed, and the zombie's last lease
+        // is on record: everything re-attach checks except the epoch.
+        backend
+            .last_lease
+            .insert(id, ("w1".to_string(), zombie.lease_fence));
+
+        let outcome = backend.heartbeat_lease(id, "w1", zombie.lease_fence).await;
+        assert!(
+            matches!(outcome, Err(StateBackendError::FenceLost(_))),
+            "a zombie re-attached past a claim and release: {outcome:?}"
+        );
+        let item = backend.get_work_item(id).await.unwrap().expect("item");
+        assert!(item.worker_id.is_none(), "the zombie holds the item");
     }
 }

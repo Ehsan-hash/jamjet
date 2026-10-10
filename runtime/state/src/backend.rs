@@ -103,6 +103,28 @@ pub trait StateBackend: Send + Sync {
         status: WorkflowStatus,
     ) -> BackendResult<()>;
 
+    /// End a live execution: set its terminal `status` and append its
+    /// terminal `event` (`WorkflowCancelled`, `WorkflowCompleted`,
+    /// `WorkflowFailed`) as one atomic step. The event's sequence is assigned
+    /// here, like [`append_event`](Self::append_event).
+    ///
+    /// The status column and the event log are two records of one fact, and
+    /// [`commit_turn_unless_terminal`](Self::commit_turn_unless_terminal)
+    /// reads the status. Written apart, a fenced commit landing between the two
+    /// writes saw `Running` and recorded `NodeCompleted` after the terminal
+    /// event (PR #140 re-review, I-A). Written together, a commit sees either
+    /// neither or both.
+    ///
+    /// An execution that is already terminal is left untouched and its status
+    /// returned as [`ExecutionFinish::AlreadyTerminal`], so two racing
+    /// terminations record one terminal event, not two. A non-terminal
+    /// `status` is an error; an unknown execution is `NotFound`.
+    async fn finish_execution(
+        &self,
+        event: Event,
+        status: WorkflowStatus,
+    ) -> BackendResult<ExecutionFinish>;
+
     /// Update the current_state of a workflow execution (apply state patches).
     async fn update_execution_current_state(
         &self,
@@ -667,6 +689,15 @@ pub fn fence_epoch(lease_fence: i64) -> i64 {
 /// review, finding C1).
 pub fn epoch_after_expiry_of(lost_fence: i64) -> i64 {
     fence_epoch(lost_fence) + 1
+}
+
+/// What [`StateBackend::finish_execution`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionFinish {
+    /// The status was set and the terminal event landed at this sequence.
+    Finished(EventSequence),
+    /// The execution was already terminal: nothing was written.
+    AlreadyTerminal(WorkflowStatus),
 }
 
 /// What [`StateBackend::commit_turn_unless_terminal`] did.
