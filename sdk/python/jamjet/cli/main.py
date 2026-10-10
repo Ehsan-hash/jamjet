@@ -1773,8 +1773,9 @@ async def _worker_loop(
     ``lease_secs`` is the lease the worker asks the engine for on every claim
     (the engine default, 30 s, when ``None``); a worker running long steps
     asks for what it can heartbeat comfortably. Heartbeats are sent every
-    ``heartbeat_interval_s`` seconds, a third of the lease by default, from a
-    task on the event loop. A heartbeat answer that carries a new
+    ``heartbeat_interval_s`` seconds, by default a third of the lease the
+    engine granted (the claim answer's ``lease_secs``), from a task on the
+    event loop. A heartbeat answer that carries a new
     ``lease_fence`` means the engine re-attached a lease that had expired
     while it was unreachable; the worker completes with that fence. A synchronous handler
     therefore runs in a worker thread (``asyncio.to_thread``), never on the
@@ -1790,7 +1791,17 @@ async def _worker_loop(
 
     from jamjet.worker_context import WorkContext, reset_current_work, set_current_work
 
-    interval = heartbeat_interval_s if heartbeat_interval_s is not None else max(1.0, (lease_secs or 30) / 3)
+    def _heartbeat_interval(work_item: dict[str, Any]) -> float:
+        # Pace from the lease the engine GRANTED, which it echoes in the claim
+        # answer and which may differ from the one asked for (it holds requests
+        # to [5, 3600] s). Pacing from the request let a worker that asked for
+        # 20000 s heartbeat every 6667 s against a 3600 s lease.
+        if heartbeat_interval_s is not None:
+            return heartbeat_interval_s
+        granted = work_item.get("lease_secs")
+        if not isinstance(granted, (int, float)) or isinstance(granted, bool) or granted <= 0:
+            granted = lease_secs or 30
+        return max(1.0, granted / 3)
 
     while True:
         try:
@@ -1816,6 +1827,7 @@ async def _worker_loop(
             idempotency_key: str | None = work_item.get("idempotency_key")
 
             console.print(f"[cyan]Claimed[/cyan] id={item_id} node=[bold]{node_id}[/bold] exec={exec_id}")
+            interval = _heartbeat_interval(work_item)
 
             ctx = WorkContext(item_id=item_id, execution_id=exec_id, node_id=node_id)
             ctx_token = set_current_work(ctx)
@@ -1994,7 +2006,10 @@ def worker(
     lease_secs: int | None = typer.Option(
         None,
         "--lease-secs",
-        help="Lease to ask for on each claim, in seconds (engine default 30); heartbeats run at a third of it",
+        min=5,
+        max=3600,
+        help="Lease to ask for on each claim, in seconds, 5 to 3600 (engine default 30); "
+        "heartbeats run at a third of the lease granted",
     ),
 ) -> None:
     """Poll the runtime for python_tool work items and invoke @tool handlers.

@@ -572,3 +572,51 @@ async def test_worker_completes_with_the_fence_a_reattaching_heartbeat_returned(
     await _worker_loop(stub, "test-worker", ["python_tool"], once=True, heartbeat_interval_s=0.1)
     assert len(stub.heartbeat_calls) >= 1
     assert stub.complete_calls[0]["lease_fence"] == 12, "after a re-attach the completion must carry the new fence"
+
+
+# (i) PR #140 review, finding I5: the worker paced its heartbeats from the lease
+#     it ASKED for, not the one the engine granted. Asking for 20000 s against
+#     the engine's 3600 s ceiling meant a heartbeat every 6667 s: the lease
+#     always lapsed first, a second worker claimed, and the step ran twice.
+
+
+def _sleep_long_sync(input: dict) -> dict:
+    _time.sleep(1.6)
+    return {"slept": True}
+
+
+async def test_worker_paces_heartbeats_from_the_granted_lease() -> None:
+    item = dict(
+        _SLEEP_SYNC_ITEM,
+        payload={"module": "tests.test_worker", "function": "_sleep_long_sync", "input": {}},
+        # The engine held the request to its bounds and says so in the answer.
+        lease_secs=3,
+    )
+    stub = _LeaseRecordingClient(claimed_item=item)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True, lease_secs=20000)
+
+    assert stub.claim_lease_secs == [20000]
+    assert len(stub.heartbeat_calls) >= 1, (
+        "a 3 s granted lease must be heartbeated about every second, not at a third of the 20000 s the worker asked for"
+    )
+
+
+def test_worker_cli_refuses_a_lease_outside_the_engine_bounds(monkeypatch: Any) -> None:
+    from typer.testing import CliRunner
+
+    import jamjet.cli.main as cli
+
+    started: list[int | None] = []
+
+    async def _no_loop(*args: Any, lease_secs: int | None = None, **kwargs: Any) -> None:
+        started.append(lease_secs)
+
+    # Never poll a real runtime: an accepted flag just records what it got.
+    monkeypatch.setattr(cli, "_worker_loop", _no_loop)
+    for bad in ("0", "4", "3601", "20000"):
+        result = CliRunner().invoke(cli.app, ["worker", "--once", "--lease-secs", bad])
+        assert result.exit_code == 2, f"--lease-secs {bad} must be refused, got {result.exit_code}: {result.output}"
+    assert started == [], f"a refused flag must not start the worker, started with {started}"
+    result = CliRunner().invoke(cli.app, ["worker", "--once", "--lease-secs", "600"])
+    assert result.exit_code == 0, result.output
+    assert started == [600]
