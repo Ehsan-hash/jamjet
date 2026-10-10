@@ -111,3 +111,90 @@ pub async fn register_and_start(state: &AppState, ir: Value, input: Value) -> St
         .expect("execution_id in start response")
         .to_string()
 }
+
+/// A backend a route test runs against, with a way to read a work item's
+/// settlement that does not depend on the backend's own read path.
+///
+/// The route tests used to run on `InMemoryBackend` only, and memory and
+/// SQLite disagreed on what "settle" means (PR #140 review, finding I2). A
+/// test that loops over [`backends`] cannot pass on one and fail on the other.
+pub enum TestBackend {
+    Memory(Arc<jamjet_state::InMemoryBackend>),
+    Sqlite {
+        backend: Arc<jamjet_state::SqliteBackend>,
+        url: String,
+    },
+}
+
+impl TestBackend {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TestBackend::Memory(_) => "memory",
+            TestBackend::Sqlite { .. } => "sqlite",
+        }
+    }
+
+    pub fn dyn_backend(&self) -> Arc<dyn StateBackend> {
+        match self {
+            TestBackend::Memory(b) => b.clone(),
+            TestBackend::Sqlite { backend, .. } => backend.clone(),
+        }
+    }
+
+    /// Where the item stands: `"pending"` or `"claimed"` while it is live,
+    /// then the settled status (`"completed"`, `"failed"`, ...). Memory drops
+    /// a settled item, which reads as `"settled"`.
+    pub async fn item_status(&self, id: uuid::Uuid) -> String {
+        match self {
+            TestBackend::Memory(b) => match b.get_work_item(id).await.unwrap() {
+                Some(item) if item.worker_id.is_some() => "claimed".into(),
+                Some(_) => "pending".into(),
+                None => "settled".into(),
+            },
+            TestBackend::Sqlite { url, .. } => {
+                let pool = sqlx::SqlitePool::connect(url).await.unwrap();
+                let (status,): (String,) =
+                    sqlx::query_as("SELECT status FROM work_items WHERE id = ?")
+                        .bind(id.to_string())
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                pool.close().await;
+                status
+            }
+        }
+    }
+
+    /// Whether the item has been settled, in whatever way the backend
+    /// records that.
+    pub async fn is_settled(&self, id: uuid::Uuid) -> bool {
+        !matches!(self.item_status(id).await.as_str(), "pending" | "claimed")
+    }
+
+    /// Backdate the item's lease so the next claim poll finds it expired.
+    pub async fn expire_lease(&self, id: uuid::Uuid) {
+        match self {
+            TestBackend::Memory(b) => b.force_lease_expired_for_test(id),
+            TestBackend::Sqlite { backend, .. } => {
+                backend.force_lease_expired_for_test(id).await.unwrap()
+            }
+        }
+    }
+}
+
+/// A fresh in-memory backend and a fresh SQLite database on disk.
+pub async fn backends() -> Vec<TestBackend> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("jamjet_route_{}.db", uuid::Uuid::new_v4().simple()));
+    let url = format!("sqlite://{}", path.display());
+    let sqlite = jamjet_state::SqliteBackend::open(&url)
+        .await
+        .expect("open test db");
+    vec![
+        TestBackend::Memory(Arc::new(jamjet_state::InMemoryBackend::new())),
+        TestBackend::Sqlite {
+            backend: Arc::new(sqlite),
+            url,
+        },
+    ]
+}

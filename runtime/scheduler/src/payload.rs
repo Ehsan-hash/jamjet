@@ -117,8 +117,32 @@ pub fn build_work_item_payload(
     payload
 }
 
+/// How many attempts a node's work item gets, from its named retry policy.
+///
+/// One declaration, shared by the scheduler and `POST /executions` (which
+/// enqueues the start node itself), so the start node cannot get a different
+/// budget from every node after it.
+pub fn max_attempts_for(retry_policy: Option<&str>) -> u32 {
+    match retry_policy {
+        Some("no_retry") => 1,
+        Some("io_default") => 5,
+        Some("llm_default") => 3,
+        _ => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn named_retry_policies_map_to_their_attempt_budgets() {
+        use super::max_attempts_for;
+        assert_eq!(max_attempts_for(Some("no_retry")), 1);
+        assert_eq!(max_attempts_for(Some("io_default")), 5);
+        assert_eq!(max_attempts_for(Some("llm_default")), 3);
+        assert_eq!(max_attempts_for(Some("unknown")), 3);
+        assert_eq!(max_attempts_for(None), 3);
+    }
+
     use super::*;
 
     fn ir_with(node_json: Value) -> WorkflowIr {

@@ -418,13 +418,8 @@ impl Scheduler {
                 self.backend.append_event(sched_event).await?;
 
                 // Enqueue work item.
-                // Default max_attempts based on retry policy name (Phase 2: full policy resolution).
-                let max_attempts: u32 = match node.retry_policy.as_deref() {
-                    Some("no_retry") => 1,
-                    Some("io_default") => 5,
-                    Some("llm_default") => 3,
-                    _ => 3,
-                };
+                // Attempt budget from the node's named retry policy (Phase 2: full policy resolution).
+                let max_attempts = crate::payload::max_attempts_for(node.retry_policy.as_deref());
 
                 // One builder for every node, shared with `POST /executions` so
                 // the start node carries the same enrichment as every later one.
@@ -645,7 +640,12 @@ impl ExecProgress {
                 // eventual ApprovalReceived decision and wedge the execution.
             }
             EventKind::RetryScheduled { node_id, .. } => {
-                self.scheduled.insert(node_id.clone());
+                // Same guard as `NodeScheduled`: a retry recorded after the node
+                // reached a terminal outcome (a lease reclaim racing the
+                // completion of the item it re-queued) must not resurrect it.
+                if !self.completed.contains(node_id) && !self.terminal_failed.contains(node_id) {
+                    self.scheduled.insert(node_id.clone());
+                }
             }
             EventKind::NodeParked { .. } => {
                 // NodeParked is an audit/observability event. The node is
@@ -1034,6 +1034,64 @@ mod tests {
              — the execution would never reach a terminal state, on this fold and \
              on every replay of the same log"
         );
+    }
+
+    /// The same guard on `RetryScheduled` (PR #140 review, finding I4).
+    ///
+    /// The claim path's fast reclaim writes `NodeFailed` + `RetryScheduled` for
+    /// a lost lease. If another worker claims and completes the item first,
+    /// the log reads `NodeCompleted` and then the retry. Re-inserting the node
+    /// into `scheduled` there wedges the run exactly as a late `NodeStarted`
+    /// would.
+    #[test]
+    fn a_late_retry_scheduled_does_not_resurrect_a_completed_node() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+            node_completed("a", serde_json::json!({})),
+            EventKind::NodeFailed {
+                node_id: "a".into(),
+                error: "lease expired: worker presumed dead".into(),
+                attempt: 0,
+                retryable: true,
+            },
+            EventKind::RetryScheduled {
+                node_id: "a".into(),
+                attempt: 1,
+                delay_ms: 0,
+            },
+        ]);
+        assert!(progress.completed.contains("a"));
+        assert!(
+            !progress.scheduled.contains("a"),
+            "a late RetryScheduled must not put a COMPLETED node back in `scheduled`"
+        );
+    }
+
+    /// And for a terminally-failed node.
+    #[test]
+    fn a_late_retry_scheduled_does_not_resurrect_a_terminally_failed_node() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+            EventKind::NodeFailed {
+                node_id: "a".into(),
+                error: "dead".into(),
+                attempt: 3,
+                retryable: false,
+            },
+            EventKind::RetryScheduled {
+                node_id: "a".into(),
+                attempt: 3,
+                delay_ms: 0,
+            },
+        ]);
+        assert!(progress.terminal_failed.contains("a"));
+        assert!(!progress.scheduled.contains("a"));
     }
 
     /// The same guard for a terminally-failed node.

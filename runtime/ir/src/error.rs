@@ -27,6 +27,13 @@ pub enum IrError {
         reason: String,
     },
 
+    #[error("external_fn node '{node}' queue `{queue}` is invalid: {reason}")]
+    InvalidQueueName {
+        node: String,
+        queue: String,
+        reason: String,
+    },
+
     #[error("condition node '{node}' branch targets unknown node '{target}'")]
     UnknownBranchTarget { node: String, target: String },
 

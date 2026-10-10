@@ -61,3 +61,48 @@ async fn an_external_fn_node_is_claimable_from_its_named_queue_with_handler_and_
     assert_eq!(wi["payload"]["handler"], "authorize");
     assert_eq!(wi["payload"]["input"]["key"], "value");
 }
+
+/// M6 (PR #140 review): an `external_fn` queue name is validated when the
+/// workflow is registered. An empty name, a built-in queue's name (whose
+/// worker cannot run the node: a `python_tool` worker gets a payload with no
+/// module or function and fails it three times), or a name outside a safe
+/// charset is refused at the moment the author is listening.
+#[tokio::test]
+async fn an_external_fn_queue_name_must_be_a_safe_non_builtin_name() {
+    let too_long = "q".repeat(jamjet_ir::MAX_QUEUE_NAME_LEN + 1);
+    for bad in [
+        "",
+        too_long.as_str(),
+        "python_tool",
+        "java_tool",
+        "model",
+        "general",
+        "tool",
+        "retrieval",
+        "privileged",
+        "has space",
+        "slash/name",
+        "über",
+    ] {
+        let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+        let state = make_state(backend);
+        let mut ir = external_fn_ir();
+        ir["nodes"]["authorize"]["kind"]["queue"] = json!(bad);
+        let (st, body) = post(&state, "/workflows", json!({ "ir": ir })).await;
+        assert!(
+            st.is_client_error(),
+            "queue name {bad:?} must be refused at registration, got {st} {body}"
+        );
+    }
+    for good in ["pas-control", "gpu_queue.v2", "A1"] {
+        let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+        let state = make_state(backend);
+        let mut ir = external_fn_ir();
+        ir["nodes"]["authorize"]["kind"]["queue"] = json!(good);
+        let (st, body) = post(&state, "/workflows", json!({ "ir": ir })).await;
+        assert!(
+            st.is_success(),
+            "queue name {good:?} must register, got {st} {body}"
+        );
+    }
+}

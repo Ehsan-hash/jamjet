@@ -42,22 +42,6 @@
 
 use serde_json::Value;
 
-/// Evaluate a Condition-node branch expression against committed workflow state.
-///
-/// Pure + total: never panics; a malformed or unsupported expression returns `false`.
-///
-/// # Truthiness rule (bare-path form)
-///
-/// Falsy: absent path, `null`, `false`, `0`/`0.0`, `""`, `[]`, `{}`.
-/// Everything else is truthy.
-///
-/// # Literal parsing (comparison form)
-///
-/// The RHS must be a valid JSON literal: a double-quoted string (`"x"`),
-/// `true`, `false`, `null`, or a JSON number. Bare words (e.g. `done`) are NOT
-/// valid literals; an unparseable RHS causes the whole comparison to return
-/// `false` (fail-closed). Comparison uses typed `serde_json::Value` equality:
-/// `"5" != 5`.
 /// Check that a branch expression is one this evaluator can ever satisfy.
 ///
 /// `eval_condition` is total and fail-closed: an expression it does not
@@ -96,6 +80,22 @@ fn require_state_path(lhs: &str) -> Result<(), String> {
     }
 }
 
+/// Evaluate a Condition-node branch expression against committed workflow state.
+///
+/// Pure + total: never panics; a malformed or unsupported expression returns `false`.
+///
+/// # Truthiness rule (bare-path form)
+///
+/// Falsy: absent path, `null`, `false`, `0`/`0.0`, `""`, `[]`, `{}`.
+/// Everything else is truthy.
+///
+/// # Literal parsing (comparison form)
+///
+/// The RHS must be a valid JSON literal: a double-quoted string (`"x"`),
+/// `true`, `false`, `null`, or a JSON number. Bare words (e.g. `done`) are NOT
+/// valid literals; an unparseable RHS causes the whole comparison to return
+/// `false` (fail-closed). Comparison uses typed `serde_json::Value` equality:
+/// `"5" != 5`.
 pub fn eval_condition(expr: &str, state: &Value) -> bool {
     let expr = expr.trim();
     if expr.is_empty() {
