@@ -1320,6 +1320,33 @@ impl StateBackend for FailFirstGetEvents {
             .await
     }
 
+    async fn start_execution_atomic(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) -> jamjet_state::backend::BackendResult<()> {
+        self.inner
+            .start_execution_atomic(execution, started_event, scheduled_event, work_item)
+            .await
+    }
+
+    async fn append_event_if(
+        &self,
+        event: jamjet_state::Event,
+        condition: &jamjet_state::backend::EventCondition,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::ConditionalAppend> {
+        self.inner.append_event_if(event, condition).await
+    }
+
+    async fn execution_tenant(
+        &self,
+        id: &ExecutionId,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::TenantId>> {
+        self.inner.execution_tenant(id).await
+    }
+
     async fn release_tool_reservation(
         &self,
         key: &str,

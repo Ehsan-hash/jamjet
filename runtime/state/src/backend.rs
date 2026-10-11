@@ -121,6 +121,13 @@ pub trait StateBackend: Send + Sync {
     /// Load a workflow execution by id.
     async fn get_execution(&self, id: &ExecutionId) -> BackendResult<Option<WorkflowExecution>>;
 
+    /// The tenant an execution belongs to, from its execution row: the one
+    /// authoritative record of a run's tenant. `None` for an unknown
+    /// execution (or, on a tenant-scoped backend, one of another tenant).
+    /// Components that run unscoped (the scheduler) use it to attribute what
+    /// they record about a run, such as the audit entries of its expiries.
+    async fn execution_tenant(&self, id: &ExecutionId) -> BackendResult<Option<TenantId>>;
+
     /// Update the status of a workflow execution.
     async fn update_execution_status(
         &self,
@@ -149,6 +156,26 @@ pub trait StateBackend: Send + Sync {
         event: Event,
         status: WorkflowStatus,
     ) -> BackendResult<ExecutionFinish>;
+
+    /// Append `event` only if `condition` holds for the execution's whole
+    /// event log, read in the same step as the append, and the execution is
+    /// live. The event's sequence is assigned here.
+    ///
+    /// The compare-and-set the approval loop needs: a human decision and the
+    /// deadline sweep each resolve a request only while it is still pending
+    /// (`approvals::still_pending`). Read and appended apart, a decision and
+    /// an expiry of one request could both land and the record would hold two
+    /// outcomes. Under this method exactly one does; the other is
+    /// [`ConditionalAppend::Refused`] and writes nothing.
+    ///
+    /// `condition` must be a pure function of the log. A terminal execution
+    /// is [`ConditionalAppend::ExecutionTerminal`] and an unknown one
+    /// `NotFound`; nothing is written either way.
+    async fn append_event_if(
+        &self,
+        event: Event,
+        condition: &crate::backend::EventCondition,
+    ) -> BackendResult<ConditionalAppend>;
 
     /// Update the current_state of a workflow execution (apply state patches).
     async fn update_execution_current_state(
@@ -212,6 +239,24 @@ pub trait StateBackend: Send + Sync {
         &self,
         execution: WorkflowExecution,
         seed_snapshot: Snapshot,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) -> BackendResult<()>;
+
+    /// Start a fresh run in one atomic step: the execution row, its
+    /// `WorkflowStarted`, the start node's `NodeScheduled` and the start node's
+    /// work item. A reader sees all four or none.
+    ///
+    /// Written apart, a scheduler tick landing after the execution row and
+    /// before `NodeScheduled` found a running execution whose start node (a
+    /// root of the graph) had not been scheduled, and scheduled it too: the
+    /// start node ran twice. [`create_segment_atomic`](Self::create_segment_atomic)
+    /// is the same step for a continuation segment, which also has a seed
+    /// snapshot. The execution id MUST be fresh.
+    async fn start_execution_atomic(
+        &self,
+        execution: WorkflowExecution,
         started_event: EventKind,
         scheduled_event: EventKind,
         work_item: WorkItem,
@@ -723,6 +768,21 @@ pub enum ExecutionFinish {
     Finished(EventSequence),
     /// The execution was already terminal: nothing was written.
     AlreadyTerminal(WorkflowStatus),
+}
+
+/// The condition [`StateBackend::append_event_if`] appends under: a pure
+/// function of an execution's whole event log.
+pub type EventCondition = dyn for<'e> Fn(&'e [Event]) -> bool + Send + Sync;
+
+/// What [`StateBackend::append_event_if`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalAppend {
+    /// The condition held: the event landed at this sequence.
+    Appended(EventSequence),
+    /// The condition did not hold: nothing was written.
+    Refused,
+    /// The execution is terminal: nothing was written.
+    ExecutionTerminal(WorkflowStatus),
 }
 
 /// What [`StateBackend::commit_turn_unless_terminal`] did.

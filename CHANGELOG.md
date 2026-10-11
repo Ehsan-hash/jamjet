@@ -202,6 +202,40 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     starts no run (a warning is logged at each due time), unless the opt-out is
     set, in which case it runs in `default`.
 
+- **Approval requests can expire.** A tenant, workflow or node policy may set
+  `approval_timeout_secs` (1 s to 1 year) and `escalate_after_secs` (shorter, same
+  policy). Every level is a ceiling: the shortest timeout and the shortest escalation
+  any of tenant, workflow and node sets apply, so a workflow or node can only shorten
+  the tenant's deadline (an escalation that would not come first is dropped and
+  logged; the timeout is never extended). A request records `expires_at` and `escalate_at` (UTC) in its context, and the pending
+  listing shows them. When a request expires, the scheduler records `approval_expired`
+  and treats it as a rejection by `system:deadline`: the node and the run fail as on a
+  rejection; nothing is ever approved by a deadline. At `escalate_at` it records
+  `approval_escalated` once, for notifiers. A decision after the deadline is 409 and
+  records nothing. A decision and the expiry of one request cannot both land: each
+  appends through the new `StateBackend::append_event_if` (a trait method a custom
+  backend must implement) under the condition that the request is still pending.
+  Invalid deadlines are refused at registration and at `PUT /tenants`. The dead
+  `timeouts.approval_timeout` field is removed and a non-null value is refused when a
+  NEW version is registered, since nothing ever enforced it; a version already stored
+  with it still re-registers idempotently (and still has no deadline: register a new
+  version with `approval_timeout_secs` to get one).
+
+- **Approval requests are sealed into the audit chain.** Only the decision was sealed;
+  the request a worker or the claim route raised was in the event log alone, so what
+  was asked could be rewritten unnoticed. Every `tool_approval_required`,
+  `approval_expired` and `approval_escalated` is now sealed into the signed,
+  hash-chained audit log with its action digest and deadline. Requests are recorded
+  through one helper shared by both guards and both transports; the in-process worker
+  pool and the scheduler take the server's `AuditEnricher` (`with_sealer`) through the
+  new `ApprovalSealer` trait. Every record is sealed under the run's own tenant; the
+  scheduler reads it from the execution row through the new
+  `StateBackend::execution_tenant` (a trait method a custom backend must implement). A
+  seal that fails is recorded in the run's log as `audit_seal_failed` (naming the
+  unsealed event) and counted (`AuditEnricher::seal_failures`), since `verify_chain`
+  cannot see an entry that was never written. `ApprovalSealer::seal_approval_record`
+  returns a `Result`.
+
 - **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
   request's digest, what it covers and the exact approve command (`--show-basis` prints
   the bound payload). The command is printed alone on its line with every argument
@@ -241,6 +275,18 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   CI's tripwire is replaced rather than deleted: it used to police the *exception*, and
   now asserts the *fix* — `h2 0.3.x` and `hyper 0.14` must stay out of the tree, so a
   future dependency bump cannot quietly bring the line back.
+
+- **A log holding an event kind this build cannot read fails closed.** `EventKind`
+  gains a `#[serde(other)]` `Unknown` variant, so such a log still loads and lists
+  (`GET /executions/:id/events` shows the event as `unknown`). Nothing acts on it: the
+  approval state of every node in that run is indeterminate, so no approval covers
+  anything, no request is raised and no decision is accepted (409, "event log contains
+  event kinds this build cannot read"), and the scheduler does not advance the run,
+  recording `run_stalled` once. Downgrade note: an older build refuses to act on a log
+  a newer build wrote rather than ignoring what it cannot read. Builds from before
+  this release cannot load a log holding `approval_expired`, `approval_escalated`,
+  `audit_seal_failed` or `run_stalled` at all, so do not roll back past this release on
+  a store a newer build has written.
 
 ### Fixed
 
@@ -291,6 +337,13 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A started Java workflow does not execute its steps on the runtime: they are queued
   for a `python_tool` worker, and there is no Java worker. A new CI job runs the
   client against a runtime built from the same commit.
+- **A run's start node is scheduled once.** Starting a run was four writes (the
+  execution row, `WorkflowStarted`, the start node's `NodeScheduled`, its work item),
+  and a scheduler tick landing between the first and third saw a live run with its
+  start node unscheduled and scheduled it again, so the start node ran twice under
+  load. The four are now one write, `StateBackend::start_execution_atomic`, on every
+  backend (a new trait method: a custom backend must implement it). A run whose start
+  node does not exist is now refused before anything is written.
 
 ---
 

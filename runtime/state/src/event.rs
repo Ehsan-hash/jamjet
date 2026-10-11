@@ -282,6 +282,56 @@ pub enum EventKind {
         approver: String,
         context: serde_json::Value,
     },
+    /// The request at `request_sequence` reached its deadline undecided. A
+    /// rejection by [`DEADLINE_PRINCIPAL`]: the node fails as on a rejection,
+    /// and a later decision is refused. Appended by the scheduler's deadline
+    /// sweep only while that request is still pending, in the same step that
+    /// checks it, so it never lands beside a human decision of that request.
+    ApprovalExpired {
+        node_id: NodeId,
+        /// Sequence of the `ToolApprovalRequired` that expired.
+        request_sequence: i64,
+        /// The deadline the request carried (`context.expires_at`).
+        expires_at: DateTime<Utc>,
+        /// Always [`DEADLINE_PRINCIPAL`].
+        principal: String,
+    },
+    /// The request at `request_sequence` is still pending at its
+    /// `escalate_at`. Recorded once per request, for external notifiers (the
+    /// hook point for Slack or email routing); it changes no approval state.
+    ApprovalEscalated {
+        node_id: NodeId,
+        /// Sequence of the `ToolApprovalRequired` that escalated.
+        request_sequence: i64,
+        /// When it was due to escalate (`context.escalate_at`).
+        escalate_at: DateTime<Utc>,
+        /// When it will expire (`context.expires_at`).
+        expires_at: DateTime<Utc>,
+    },
+
+    /// An event of this run could not be sealed into the signed audit chain
+    /// (the audit write failed, or its tenant could not be read). The event
+    /// itself is durable; this marks the gap so it can be found, since
+    /// `verify_chain` cannot see an entry that was never written. Changes no
+    /// state.
+    AuditSealFailed {
+        /// The `Event.id` of the unsealed event.
+        event_id: Uuid,
+        /// Its sequence in this run's log.
+        sequence: i64,
+        /// Its `type` tag (e.g. `tool_approval_required`).
+        event_type: String,
+        /// Why the seal failed.
+        error: String,
+    },
+
+    /// The scheduler stopped advancing this run: its log holds an event kind
+    /// this build cannot read (`Unknown`), so it cannot tell what the run may
+    /// do next. Recorded once; the run stays as it is until a build that
+    /// reads the whole log takes over.
+    RunStalled {
+        reason: String,
+    },
 
     // ── Reasoning strategy lifecycle (§14.5) ─────────────────────────────
     /// Emitted when a reasoning strategy begins execution.
@@ -405,7 +455,21 @@ pub enum EventKind {
         /// The execution_id of the new segment (as a string).
         next_execution_id: String,
     },
+
+    /// An event kind this build does not know, written by a later release.
+    /// Read instead of failing the whole log, so the log still loads and
+    /// lists (its fields are dropped; re-serializing it writes only
+    /// `{"type": "unknown"}`). It is NOT ignored where it could matter: it may
+    /// be a revocation or a denial, so every fold that decides coverage or
+    /// permission fails closed on it. The approval fold reports
+    /// `NodeApprovalStatus::Indeterminate` (nothing released, no decision
+    /// accepted) and the scheduler does not advance the run (`RunStalled`).
+    #[serde(other)]
+    Unknown,
 }
+
+/// The principal an expired approval request is rejected by.
+pub const DEADLINE_PRINCIPAL: &str = "system:deadline";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -438,6 +502,8 @@ impl EventKind {
             | Self::EscalationRequired { node_id, .. }
             | Self::PolicyViolation { node_id, .. }
             | Self::ToolApprovalRequired { node_id, .. }
+            | Self::ApprovalExpired { node_id, .. }
+            | Self::ApprovalEscalated { node_id, .. }
             | Self::ChildWorkflowStarted { node_id, .. }
             | Self::ChildWorkflowCompleted { node_id, .. }
             | Self::ChildWorkflowFailed { node_id, .. }

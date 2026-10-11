@@ -148,6 +148,9 @@ pub async fn guard_dispatch(
         node_def,
         payload_input,
         false,
+        // No audit log here: the transports go through `node_guard::guard_item`,
+        // which seals the requests it raises.
+        None,
     )
     .await
 }
@@ -169,6 +172,7 @@ pub(crate) async fn guard_dispatch_in(
     node_def: &NodeDef,
     payload_input: &Value,
     node_approved: bool,
+    sealer: Option<&dyn jamjet_state::approvals::ApprovalSealer>,
 ) -> DispatchGuardOutcome {
     let fire = mode == GuardMode::Fire;
     // Load tenant policy (sits between global and workflow in the chain).
@@ -340,6 +344,12 @@ pub(crate) async fn guard_dispatch_in(
 
             let status = jamjet_state::approvals::node_approval_status(&events, node_id);
 
+            if matches!(status, NodeApprovalStatus::Indeterminate) {
+                return DispatchGuardOutcome::Unavailable {
+                    reason: jamjet_state::approvals::UNREADABLE_LOG_REASON.to_string(),
+                };
+            }
+
             // Already requested (or decided rejected: the scheduler owns the
             // failure). Hold; emit nothing.
             if matches!(
@@ -475,7 +485,14 @@ pub(crate) async fn guard_dispatch_in(
             // `gated` carries tool NAMES only: two calls to the same gated tool
             // render as ["send_wire", "send_wire"] with no discriminator.
             // `calls` is what identifies them.
-            let context = serde_json::json!({
+            let deadline =
+                match crate::node_guard::deadline_or_block(backend, execution_id, node_id, &sets)
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(blocked) => return blocked,
+                };
+            let mut context = serde_json::json!({
                 "node_id": node_id,
                 "gated_tools": gated,
                 "calls": calls_json,
@@ -486,31 +503,30 @@ pub(crate) async fn guard_dispatch_in(
                 jamjet_state::approvals::ACTION_BASIS_KEY:
                     crate::node_guard::basis_preview(&basis.payload, basis.step, node_def),
             });
-            let seq = match backend.latest_sequence(execution_id).await {
-                Ok(s) => s + 1,
-                Err(e) => {
+            if let (Some(deadline), Some(obj)) = (&deadline, context.as_object_mut()) {
+                if let Err(e) =
+                    jamjet_state::approvals::stamp_deadline(obj, deadline, chrono::Utc::now())
+                {
                     return DispatchGuardOutcome::Unavailable {
-                        reason: format!("approval required but could not be recorded: {e}"),
-                    }
+                        reason: format!("approval required but its deadline could not be set: {e}"),
+                    };
                 }
-            };
-            if let Err(e) = backend
-                .append_event(Event::new(
-                    execution_id.clone(),
-                    seq,
-                    EventKind::ToolApprovalRequired {
-                        node_id: node_id.to_string(),
-                        tool_name: gated.join(", "),
-                        approver,
-                        context,
-                    },
-                ))
-                .await
+            }
+            let request = Event::new(
+                execution_id.clone(),
+                0,
+                EventKind::ToolApprovalRequired {
+                    node_id: node_id.to_string(),
+                    tool_name: gated.join(", "),
+                    approver,
+                    context,
+                },
+            );
+            if let Err(reason) =
+                crate::node_guard::record_request(backend, sealer, request, tenant_id).await
             {
                 // Fail closed: an unrecorded request is an invisible hold.
-                return DispatchGuardOutcome::Unavailable {
-                    reason: format!("approval required but could not be recorded: {e}"),
-                };
+                return DispatchGuardOutcome::Unavailable { reason };
             }
             DispatchGuardOutcome::Held { gated }
         }
@@ -836,6 +852,7 @@ mod tests {
                 node_def,
                 input,
                 false,
+                None,
             )
             .await
         }
@@ -1284,6 +1301,95 @@ mod tests {
         );
     }
 
+    /// A per-call dispatch request carries the deadline its policy sets, like
+    /// every other request: the dispatch guard raises its own requests.
+    #[tokio::test]
+    async fn a_dispatch_request_records_its_deadline() {
+        let f = Fixture::new();
+        let mut policy = policy_json(&[], &["send_wire"]);
+        policy["approval_timeout_secs"] = json!(600);
+        policy["escalate_after_secs"] = json!(60);
+        let before = chrono::Utc::now();
+        f.guard(&ir_with(Some(policy)), &input_for(&["send_wire"]))
+            .await;
+        let requests = f.requests().await;
+        let deadline = jamjet_state::approvals::RequestDeadline::of(&requests[0].2);
+        let jamjet_state::approvals::DeadlineTime::At(expires_at) = deadline.expires_at else {
+            panic!("no expires_at: {}", requests[0].2);
+        };
+        let off = (expires_at - (before + chrono::Duration::seconds(600))).num_seconds();
+        assert!((0..=5).contains(&off), "expires_at {expires_at}");
+        assert!(matches!(
+            deadline.escalate_at,
+            jamjet_state::approvals::DeadlineTime::At(_)
+        ));
+
+        // No deadline in the policy: none on the request.
+        let g = Fixture::new();
+        g.guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
+        let requests = g.requests().await;
+        assert!(
+            requests[0].2.get("expires_at").is_none(),
+            "{}",
+            requests[0].2
+        );
+    }
+
+    /// Keeps what it is asked to seal.
+    #[derive(Default)]
+    struct CapturingSealer(std::sync::Mutex<Vec<(Event, String)>>);
+
+    #[async_trait::async_trait]
+    impl jamjet_state::approvals::ApprovalSealer for CapturingSealer {
+        async fn seal_approval_record(&self, event: &Event, tenant_id: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((event.clone(), tenant_id.to_string()));
+            Ok(())
+        }
+    }
+
+    /// A per-call dispatch request, raised through the shared guard, is
+    /// sealed with the sequence the log gave it.
+    #[tokio::test]
+    async fn a_dispatch_request_is_sealed_through_the_shared_guard() {
+        let f = Fixture::new();
+        let ir = ir(&[], &["send_wire"]);
+        let node_def = ir.node("n1").unwrap();
+        let sealer = CapturingSealer::default();
+        let outcome = crate::node_guard::guard_item(
+            f.backend.as_ref(),
+            GuardMode::Fire,
+            &f.execution_id,
+            "n1",
+            "acme",
+            ir.policy.as_ref(),
+            node_def,
+            &json!({ "input": input_for(&["send_wire"]) }),
+            Some(&sealer),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        let sealed = sealer.0.lock().unwrap().clone();
+        assert_eq!(sealed.len(), 1, "{sealed:?}");
+        let logged = f
+            .backend
+            .get_events(&f.execution_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. }))
+            .unwrap();
+        assert_eq!(sealed[0].0.id, logged.id);
+        assert_eq!(sealed[0].0.sequence, logged.sequence);
+        assert_eq!(sealed[0].1, "acme");
+    }
+
     /// Re-entering an already-pending node must not stack up requests: an
     /// approver would see duplicates and `node_approval_status` would keep
     /// resetting to Pending, so a settled decision could never stick.
@@ -1461,6 +1567,29 @@ mod tests {
             DispatchGuardOutcome::Allow
         );
         assert_eq!(f.requests().await.len(), 1);
+    }
+
+    /// An event kind this build cannot read, after the approval: the
+    /// dispatch is not released and no new request is raised.
+    #[tokio::test]
+    async fn an_unreadable_event_withholds_an_approved_dispatch() {
+        let f = Fixture::new();
+        let ir = ir(&[], &["send_wire"]);
+        hold_and_approve(&f, &ir, &input_for(&["send_wire"])).await;
+        f.backend
+            .append_event(Event::new(f.execution_id.clone(), 0, EventKind::Unknown))
+            .await
+            .unwrap();
+        let outcome = f.guard(&ir, &input_for(&["send_wire"])).await;
+        assert!(
+            matches!(&outcome, DispatchGuardOutcome::Unavailable { reason } if reason.contains("cannot read")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            f.requests().await.len(),
+            1,
+            "no new request over an unreadable log"
+        );
     }
 
     /// The node completed and is dispatched again with the same calls (a loop,

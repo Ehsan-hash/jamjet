@@ -207,6 +207,121 @@ Limits worth knowing:
 
 ---
 
+## Approval Deadlines
+
+A policy can give the approval requests it raises a deadline:
+
+```json
+{
+  "require_approval_for": ["payments.*"],
+  "approval_timeout_secs": 3600,
+  "escalate_after_secs": 900
+}
+```
+
+From the SDKs, the same keys go in a YAML `policy:` block (workflow or node
+level) or in an agent's policy dict; the Python compiler checks them as the
+runtime does and emits them only when set:
+
+```yaml
+nodes:
+  send_wire:
+    type: tool
+    tool_ref: payments.send_wire
+    policy:
+      require_approval_for: ["*"]
+      approval_timeout_secs: 3600
+      escalate_after_secs: 900
+```
+
+```python
+agent = Agent(
+    "payments",
+    model="claude-sonnet-4-5",
+    tools=[send_wire],
+    policy={"require_approval_for": ["send_*"], "approval_timeout_secs": 3600},
+)
+```
+
+The tenant level is set with `PUT /tenants/:id` (operators only). The Java
+builder has no policy support yet; use IR or the tenant policy.
+
+- `approval_timeout_secs` (1 second to 1 year): how long a request stays
+  open. When it passes, the scheduler records `approval_expired` and treats it
+  exactly as a rejection by `system:deadline`: the node fails the way a
+  rejected node does, and so does the run. An expiry never approves anything.
+- `escalate_after_secs` (optional, at least 1 and less than the timeout, and
+  only next to a timeout in the same policy): if the request is still pending
+  then, the scheduler records `approval_escalated` once. It changes nothing
+  about the request; it is the hook point for an external notifier (Slack,
+  email) to watch for.
+- Both can be set in the tenant, workflow or node policy, and every level is
+  a ceiling: the shortest `approval_timeout_secs` any level sets applies, and
+  so does the shortest `escalate_after_secs`. A workflow or node policy can
+  only shorten the tenant's deadline or bring its escalation forward; a
+  one-year node policy neither lengthens a tenant's one-hour deadline nor
+  drops its escalation. If the shortest escalation would not come before the
+  shortest timeout, the escalation is dropped (and logged), never the timeout
+  extended.
+- Invalid values are refused at registration (400) and at `PUT /tenants`
+  (400). `timeouts.approval_timeout` is retired: it was never read, so a run
+  under it never expired. A non-null value is refused when a new version is
+  registered; a version stored with it before still re-registers unchanged,
+  with no deadline.
+
+A request raised under a deadline records it in its context as UTC times,
+`expires_at` and (when set) `escalate_at`; the pending listing shows both on
+each entry. A request raised with no deadline behaves as before: it waits
+until someone decides it.
+
+Rules the runtime enforces:
+
+- **A decision after the deadline is refused (409) and records nothing**,
+  whether or not the sweep has recorded the expiry yet. The deadline is
+  reached at its instant: a decision at exactly `expires_at` is late. It is
+  checked again in the same step as the append, under the store's write lock,
+  so a decision checked in time whose write is delayed past the deadline (a
+  lock wait, a pause) is refused too. The deadline is checked before the digest
+  rules, so a late approval with no digest or a stale one is also 409
+  "expired" rather than 400 or a stale-digest 409, and a decision naming no
+  node on a run whose latest request expired says it expired.
+- **One outcome per request.** A decision and an expiry each append only while
+  the request is still the node's pending one, checked in the same step as the
+  append. If the sweep expires a request while a decision is in flight, the
+  decision gets 409; if the decision lands first, the sweep records nothing.
+  A sweep that runs again, or on another scheduler, records nothing twice.
+- **An unreadable deadline counts as passed.** Only the engine writes
+  `expires_at`; a value that is not a time is treated as expired, never as
+  open forever.
+
+Limits worth knowing:
+
+- The sweep runs on the scheduler tick (every 500 ms by default) for running
+  executions that hold a node on a request carrying a deadline (a run with
+  no deadlines is never read for it), so an expiry is recorded within a
+  tick of the deadline and the node fails on the next. A run that is not
+  `running` (paused) is not swept until it runs again; a decision on it is
+  still refused after the deadline.
+- Deadlines are computed from the clock of the process that raised the
+  request and checked against the clock of the one that sweeps or decides.
+  Keep their clocks in sync.
+- A hold raised by an agent's autonomy limit, not by a policy, has no
+  deadline.
+
+---
+
+## Event Kinds a Build Cannot Read
+
+A run's log can hold an event a newer release wrote. This build reads it as
+`unknown`, so the log still loads and the event still lists, but it does not
+guess what it meant: it could be a revocation or a denial. Every approval in
+that run is treated as not covering anything, no request is raised, a
+decision is refused (409, "event log contains event kinds this build cannot
+read"), and the scheduler stops advancing the run and records `run_stalled`
+once. Upgrade the engine to continue the run.
+
+---
+
 ## Audit Log
 
 Every human decision is recorded:
@@ -214,6 +329,30 @@ Every human decision is recorded:
 - What decision was made, and which request it answered
 - The `approved_digest` it authorised
 - Timestamp
+
+The request is recorded the same way. Every `tool_approval_required`, whichever
+component raised it (the HTTP claim route, the in-process worker, the agent
+tool dispatch guard), is sealed into the signed, hash-chained audit log next to
+the decision, with its context: the `action_digest`, what it covers and its
+deadline. So are `approval_expired` (actor `system:deadline`) and
+`approval_escalated`. Editing a sealed request, for example to point it at a
+different action, fails chain verification at that entry, exactly as editing a
+decision does.
+
+Sealing follows the durable write of the event and never undoes it. If the
+audit write fails, the run's own event log gets an `audit_seal_failed` event
+naming the unsealed event (its id, sequence and type) and why, and the
+server's enricher counts the failure.
+
+What chain verification can and cannot see: `verify_chain` checks the
+entries it is given, so it detects an edited entry, a re-ordered or inserted
+one, a broken link and a forged or stripped signature. It cannot see an
+entry that was never written (a failed seal), or entries removed from the
+end of the log. To find gaps, compare the run's event log with its audit
+entries; `audit_seal_failed` marks every gap the engine knows about. Every record is sealed
+under the run's own tenant (the scheduler reads it from the run's execution
+row), so `GET /audit` shows a tenant its own requests, expiries and
+escalations and no other tenant's.
 
 ```bash
 jamjet events exec_01abc --type approval_received

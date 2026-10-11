@@ -208,6 +208,116 @@ pub struct PolicySetIr {
     /// If non-empty, only models in this list are allowed for model nodes.
     #[serde(default)]
     pub model_allowlist: Vec<String>,
+    /// How long an approval request this policy raises stays open, in
+    /// seconds. When it passes, the request expires: the engine records
+    /// `ApprovalExpired` and treats it as a rejection by `system:deadline`.
+    /// Never an approval. `None`: no deadline at this level. Every level is a
+    /// ceiling: the shortest timeout any of tenant, workflow and node sets
+    /// applies, so a workflow or node can only shorten the tenant's. See
+    /// [`ApprovalDeadline::resolve`].
+    ///
+    /// Skipped when unset, so a policy that does not use it serializes as it
+    /// did before: a node's definition hash, which an approval binds, covers
+    /// its policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_timeout_secs: Option<u64>,
+    /// When to escalate a still-pending request, in seconds after it was
+    /// raised: the engine records `ApprovalEscalated` once, for notifiers.
+    /// Requires `approval_timeout_secs` at the same level, and must be shorter.
+    /// The shortest escalation any level sets applies, and is dropped if it
+    /// would not come before the effective timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalate_after_secs: Option<u64>,
+}
+
+/// The longest approval deadline a policy may set: one year. Bounded so that
+/// `now + timeout` cannot overflow and a typo cannot park a request forever.
+pub const MAX_APPROVAL_TIMEOUT_SECS: u64 = 365 * 24 * 60 * 60;
+
+/// The deadline an approval request is raised with, resolved from a policy
+/// chain by [`ApprovalDeadline::resolve`]. `escalate_after_secs`, when set, is
+/// always less than `timeout_secs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalDeadline {
+    pub timeout_secs: u64,
+    pub escalate_after_secs: Option<u64>,
+}
+
+impl PolicySetIr {
+    /// Check this level's deadline settings: `approval_timeout_secs` is 1 to
+    /// [`MAX_APPROVAL_TIMEOUT_SECS`]; `escalate_after_secs` needs a timeout at
+    /// the same level and is at least 1 and shorter than it. A pair is
+    /// checked together because the chain resolves it together.
+    pub fn validate_approval_deadline(&self) -> Result<(), String> {
+        match (self.approval_timeout_secs, self.escalate_after_secs) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(
+                "escalate_after_secs needs approval_timeout_secs in the same policy".to_string(),
+            ),
+            (Some(t), escalate) => {
+                if !(1..=MAX_APPROVAL_TIMEOUT_SECS).contains(&t) {
+                    return Err(format!(
+                        "approval_timeout_secs must be between 1 and {MAX_APPROVAL_TIMEOUT_SECS}, got {t}"
+                    ));
+                }
+                match escalate {
+                    Some(e) if !(1..t).contains(&e) => Err(format!(
+                        "escalate_after_secs must be at least 1 and less than \
+                         approval_timeout_secs ({t}), got {e}"
+                    )),
+                    _ => Ok(()),
+                }
+            }
+        }
+    }
+}
+
+/// What [`ApprovalDeadline::resolve`] found for a policy chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineResolution {
+    /// The deadline a request raised under the chain carries, if any level
+    /// sets one.
+    pub deadline: Option<ApprovalDeadline>,
+    /// An escalation some level asked for that would not come before the
+    /// effective timeout, so it was dropped. The caller logs it.
+    pub dropped_escalation_secs: Option<u64>,
+}
+
+impl ApprovalDeadline {
+    /// The deadline for a request raised under `sets` (tenant, workflow,
+    /// node, in any order). Every level is a CEILING: the effective timeout
+    /// is the shortest any level sets, and the effective escalation the
+    /// shortest any level sets. A workflow or node policy can therefore only
+    /// shorten what the tenant set, never lengthen or drop it. If the
+    /// escalation would not come before the timeout, it is dropped (reported
+    /// in `dropped_escalation_secs`); the timeout is never extended to fit it.
+    ///
+    /// A level whose settings fail [`PolicySetIr::validate_approval_deadline`]
+    /// is an error, never skipped: skipping it could lengthen the deadline.
+    pub fn resolve(sets: &[&PolicySetIr]) -> Result<DeadlineResolution, String> {
+        for set in sets {
+            set.validate_approval_deadline()?;
+        }
+        let Some(timeout_secs) = sets.iter().filter_map(|s| s.approval_timeout_secs).min() else {
+            return Ok(DeadlineResolution {
+                deadline: None,
+                dropped_escalation_secs: None,
+            });
+        };
+        let escalation = sets.iter().filter_map(|s| s.escalate_after_secs).min();
+        let (escalate_after_secs, dropped_escalation_secs) = match escalation {
+            Some(e) if e < timeout_secs => (Some(e), None),
+            Some(e) => (None, Some(e)),
+            None => (None, None),
+        };
+        Ok(DeadlineResolution {
+            deadline: Some(ApprovalDeadline {
+                timeout_secs,
+                escalate_after_secs,
+            }),
+            dropped_escalation_secs,
+        })
+    }
 }
 
 /// Per-execution token budget configuration.
@@ -425,5 +535,117 @@ mod tests {
         let ir = WorkflowIr::from_json(json).expect("must deserialize");
         let policy = ir.policy.unwrap();
         assert_eq!(policy.require_approval_for, vec!["*"]);
+    }
+
+    fn deadline(t: Option<u64>, e: Option<u64>) -> PolicySetIr {
+        PolicySetIr {
+            approval_timeout_secs: t,
+            escalate_after_secs: e,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_deadline_is_validated_as_a_pair() {
+        for ok in [
+            deadline(None, None),
+            deadline(Some(1), None),
+            deadline(Some(2), Some(1)),
+            deadline(
+                Some(MAX_APPROVAL_TIMEOUT_SECS),
+                Some(MAX_APPROVAL_TIMEOUT_SECS - 1),
+            ),
+        ] {
+            assert!(ok.validate_approval_deadline().is_ok(), "{ok:?}");
+        }
+        for bad in [
+            deadline(Some(0), None),
+            deadline(Some(MAX_APPROVAL_TIMEOUT_SECS + 1), None),
+            deadline(None, Some(5)),
+            deadline(Some(10), Some(10)),
+            deadline(Some(10), Some(11)),
+            deadline(Some(10), Some(0)),
+        ] {
+            assert!(bad.validate_approval_deadline().is_err(), "{bad:?}");
+        }
+    }
+
+    fn resolved(sets: &[&PolicySetIr]) -> Option<ApprovalDeadline> {
+        ApprovalDeadline::resolve(sets).unwrap().deadline
+    }
+
+    /// Every level is a ceiling: the shortest timeout and the shortest
+    /// escalation, whichever levels set them.
+    #[test]
+    fn the_shortest_timeout_and_escalation_apply() {
+        let tenant = deadline(Some(100), Some(10));
+        let workflow = deadline(Some(200), None);
+        let node = deadline(Some(MAX_APPROVAL_TIMEOUT_SECS), None);
+        assert_eq!(
+            resolved(&[&tenant, &workflow, &node]),
+            Some(ApprovalDeadline {
+                timeout_secs: 100,
+                escalate_after_secs: Some(10)
+            }),
+            "a longer lower level neither lengthens nor drops the tenant's"
+        );
+        let node = deadline(Some(50), Some(5));
+        assert_eq!(
+            resolved(&[&tenant, &workflow, &node]),
+            Some(ApprovalDeadline {
+                timeout_secs: 50,
+                escalate_after_secs: Some(5)
+            })
+        );
+        assert_eq!(resolved(&[&deadline(None, None)]), None);
+        assert_eq!(resolved(&[]), None);
+    }
+
+    /// An escalation that would not come before the effective timeout is
+    /// dropped and reported; the timeout is never extended to fit it.
+    #[test]
+    fn an_escalation_past_the_effective_timeout_is_dropped() {
+        let tenant = deadline(Some(100), Some(90));
+        let node = deadline(Some(30), None);
+        let r = ApprovalDeadline::resolve(&[&tenant, &node]).unwrap();
+        assert_eq!(
+            r.deadline,
+            Some(ApprovalDeadline {
+                timeout_secs: 30,
+                escalate_after_secs: None
+            })
+        );
+        assert_eq!(r.dropped_escalation_secs, Some(90));
+        // Exactly at the timeout is not before it.
+        let r =
+            ApprovalDeadline::resolve(&[&deadline(Some(100), Some(30)), &deadline(Some(30), None)])
+                .unwrap();
+        assert_eq!(r.dropped_escalation_secs, Some(30));
+    }
+
+    /// An invalid level is an error even when a more specific level would
+    /// win: never skipped, never a fallback.
+    #[test]
+    fn an_invalid_level_fails_resolution() {
+        let bad = deadline(Some(0), None);
+        let node = deadline(Some(300), None);
+        assert!(ApprovalDeadline::resolve(&[&bad, &node]).is_err());
+        assert!(ApprovalDeadline::resolve(&[&node, &deadline(Some(5), Some(9))]).is_err());
+    }
+
+    /// An unset deadline is not serialized, so a node definition (and the
+    /// definition hash an approval binds) is unchanged by the new fields.
+    #[test]
+    fn an_unset_deadline_does_not_change_a_serialized_policy() {
+        let p = PolicySetIr {
+            require_approval_for: vec!["*".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            serde_json::json!({
+                "blocked_tools": [], "require_approval_for": ["*"], "model_allowlist": []
+            })
+        );
     }
 }

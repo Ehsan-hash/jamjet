@@ -247,6 +247,10 @@ async fn create_workflow(
     // Node ids are printed into commands a reviewer pastes into a shell.
     jamjet_ir::validate_node_ids(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // An approval deadline the engine cannot honour is refused rather than
+    // stored.
+    jamjet_ir::validate_approval_deadlines(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
 
@@ -269,6 +273,13 @@ async fn create_workflow(
             Json(json!({ "workflow_id": workflow_id, "version": version })),
         ));
     }
+
+    // The retired `timeouts.approval_timeout` (nothing read it, so a run under
+    // it never expired) is refused for a NEW registration only, after the
+    // idempotent re-register above: a version stored with it before this
+    // release keeps re-registering on boot.
+    jamjet_ir::refuse_retired_timeouts(&body.ir)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let def = WorkflowDefinition {
         workflow_id: workflow_id.clone(),
@@ -320,7 +331,8 @@ async fn start_execution(
 }
 
 /// Start one run of `workflow_id`: the execution record, `WorkflowStarted`
-/// (with `initiated_by`) and the start node's work item. The ONE start path,
+/// (with `initiated_by`), the start node's `NodeScheduled` and its work item,
+/// written in one atomic step. The ONE start path,
 /// shared by `POST /executions`, the MCP bridge's `jamjet_run_workflow` and the
 /// in-process cron launcher (whose runs take the job's creator as initiator),
 /// so the start item, its payload and the initiator cannot diverge by
@@ -371,20 +383,13 @@ pub async fn start_run(
         segment_number: 0,
     };
     let execution_id = execution.execution_id.clone();
-    backend.create_execution(execution).await?;
 
-    // Append WorkflowStarted event.
-    let event = jamjet_state::Event::new(
-        execution_id.clone(),
-        1,
-        jamjet_state::EventKind::WorkflowStarted {
-            workflow_id: workflow_id.clone(),
-            workflow_version: version.clone(),
-            initial_input: input.clone(),
-            initiated_by,
-        },
-    );
-    backend.append_event(event).await?;
+    let started = jamjet_state::EventKind::WorkflowStarted {
+        workflow_id: workflow_id.clone(),
+        workflow_version: version.clone(),
+        initial_input: input.clone(),
+        initiated_by,
+    };
 
     // Immediately enqueue the start node as a work item, built by the same
     // payload builder the scheduler uses for every later node. Until 2026-09-06
@@ -416,15 +421,10 @@ pub async fn start_run(
         &version,
     );
     let max_attempts = jamjet_scheduler::max_attempts_for(start_def.retry_policy.as_deref());
-    let sched_event = jamjet_state::Event::new(
-        execution_id.clone(),
-        2,
-        jamjet_state::EventKind::NodeScheduled {
-            node_id: start_node.clone(),
-            queue_type: queue_type.clone(),
-        },
-    );
-    backend.append_event(sched_event).await?;
+    let scheduled = jamjet_state::EventKind::NodeScheduled {
+        node_id: start_node.clone(),
+        queue_type: queue_type.clone(),
+    };
 
     let work_item = WorkItem {
         id: Uuid::new_v4(),
@@ -440,7 +440,12 @@ pub async fn start_run(
         lease_fence: 0,
         tenant_id: tenant_id.0.clone(),
     };
-    backend.enqueue_work_item(work_item).await?;
+    // ONE write for the run's start (see `start_execution_atomic`): a
+    // scheduler tick between separate writes found the run live with its
+    // start node unscheduled and scheduled it a second time.
+    backend
+        .start_execution_atomic(execution, started, scheduled, work_item)
+        .await?;
 
     Ok((
         StatusCode::CREATED,
@@ -666,6 +671,9 @@ async fn approve_execution(
         crate::approvals::SubmitError::NoPending
         | crate::approvals::SubmitError::NodeNotPending(_)
         | crate::approvals::SubmitError::ExecutionTerminal(_)
+        | crate::approvals::SubmitError::Expired(_)
+        | crate::approvals::SubmitError::Superseded(_)
+        | crate::approvals::SubmitError::UnreadableLog
         | crate::approvals::SubmitError::StaleDigest => ApiError::Conflict(e.to_string()),
         crate::approvals::SubmitError::EditsUnsupported
         | crate::approvals::SubmitError::DigestRequired => ApiError::BadRequest(e.to_string()),
@@ -676,10 +684,10 @@ async fn approve_execution(
     // *after* the event is durably appended, never fails the request
     // (`enrich_and_append` warns-and-continues on a write error), and is off
     // the worker's fenced commit hot path — so it adds tamper-evident audit
-    // without touching the durability invariant. The per-tool-call / per-node
-    // worker events emitted through the fenced `commit_turn` path are not yet
-    // routed through the enricher (that needs the enricher threaded into the
-    // worker pool); tracked as F-t3-audit-emit.
+    // without touching the durability invariant. The request this decision
+    // answers was sealed when it was raised (`node_guard::record_request`).
+    // The per-node worker events emitted through the fenced `commit_turn` path
+    // are not yet routed through the enricher; tracked as F-t3-audit-emit.
     let ctx = jamjet_audit::RequestContext {
         actor_id,
         actor_type: jamjet_audit::ActorType::Human,
@@ -688,7 +696,13 @@ async fn approve_execution(
         path: Some(format!("/executions/{id}/approve")),
         ..Default::default()
     };
-    state.enricher.enrich_and_append(&event, Some(&ctx)).await;
+    if let Err(e) = state
+        .enricher
+        .try_enrich_and_append(&event, Some(&ctx))
+        .await
+    {
+        jamjet_state::approvals::record_seal_gap(backend.as_ref(), &event, e).await;
+    }
 
     Ok(Json(
         json!({ "execution_id": id, "node_id": node_id, "accepted": true }),
@@ -728,13 +742,23 @@ async fn list_approvals_for_execution(
         for row in &rows {
             match row.status.as_str() {
                 "pending" => {
-                    pending.push(serde_json::json!({
+                    let mut item = serde_json::json!({
                         "node_id":   row.node_id,
                         "tool_name": row.tool_name,
                         "approver":  row.approver,
                         "context":   row.context,
                         "sequence":  row.last_sequence,
-                    }));
+                    });
+                    // The deadline, as the event-log path shows it.
+                    for key in [
+                        jamjet_state::approvals::EXPIRES_AT_KEY,
+                        jamjet_state::approvals::ESCALATE_AT_KEY,
+                    ] {
+                        if let Some(v) = row.context.as_ref().and_then(|c| c.get(key)) {
+                            item[key] = v.clone();
+                        }
+                    }
+                    pending.push(item);
                 }
                 "approved" => {
                     decided.push(serde_json::json!({
@@ -1245,8 +1269,9 @@ async fn update_tenant(
         jamjet_state::tenant::parse_tenant_policy(policy).map_err(|e| {
             ApiError::BadRequest(format!(
                 "invalid policy: {e}. Send an object with blocked_tools, \
-                     require_approval_for and model_allowlist; {{}} clears the policy, and a \
-                     null or missing policy keeps the stored one"
+                     require_approval_for, model_allowlist and optionally \
+                     approval_timeout_secs and escalate_after_secs; {{}} clears the policy, \
+                     and a null or missing policy keeps the stored one"
             ))
         })?;
     }
@@ -1359,7 +1384,7 @@ async fn claim_work_item(
     // can reach a worker down this route without passing through
     // `Worker::execute_item`. See `gate_claimed_item`.
     if matches!(
-        gate_claimed_item(backend.as_ref(), &wi).await,
+        gate_claimed_item(backend.as_ref(), &wi, state.enricher.as_ref()).await,
         ClaimGate::Withhold
     ) {
         return Ok(nothing_to_claim());
@@ -1450,7 +1475,11 @@ async fn compute_idempotency_key(
 /// That distinction is deliberately unobservable here — every refusal is the
 /// same `{"claimed": false}` — so acting on it would create exactly the signal
 /// the uniform response exists to deny the caller.
-async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkItem) -> ClaimGate {
+async fn gate_claimed_item(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+    sealer: &dyn jamjet_state::approvals::ApprovalSealer,
+) -> ClaimGate {
     // AUTHORITY. The coordinates that select the policy chain come from the
     // EXECUTION record, never from the payload.
     //
@@ -1637,6 +1666,9 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
         workflow_policy.as_ref(),
         &node_def,
         &wi.payload,
+        // A request raised here is sealed into the audit chain, like one the
+        // in-process worker raises.
+        Some(sealer),
     )
     .await
     {
@@ -1769,6 +1801,8 @@ async fn completion_gate(
         workflow_policy.as_ref(),
         &node_def,
         &wi.payload,
+        // Complete mode never raises a request.
+        None,
     )
     .await
     {
@@ -2691,6 +2725,132 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    /// Review I-3: the expiries and escalations the scheduler seals belong to
+    /// the run's own tenant. `GET /audit` shows them to that tenant and not
+    /// to `default`.
+    #[tokio::test]
+    async fn swept_expiries_and_escalations_are_audited_under_the_runs_tenant() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("jamjet_seal_tenant_{}.db", Uuid::new_v4().simple()));
+        let url = format!("sqlite://{}", path.display());
+        let base = Arc::new(jamjet_state::SqliteBackend::open(&url).await.unwrap());
+        let acme = TenantId::from("acme".to_string());
+        let scoped: Arc<dyn jamjet_state::StateBackend> = Arc::new(base.for_tenant(acme.clone()));
+        let now = Utc::now();
+        scoped
+            .create_tenant(jamjet_state::Tenant {
+                id: acme.clone(),
+                name: "acme".into(),
+                status: jamjet_state::TenantStatus::Active,
+                policy: None,
+                limits: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let audit_backend = jamjet_audit::SqliteAuditBackend::open(&url).await.unwrap();
+        audit_backend.migrate().await.unwrap();
+        let audit: Arc<dyn jamjet_audit::AuditBackend> = Arc::new(audit_backend);
+        let enricher = Arc::new(AuditEnricher::with_signer(
+            Arc::clone(&audit),
+            jamjet_audit::AuditSigner::new(b"tenant-seal-key".to_vec()),
+        ));
+
+        // A run of tenant acme with a request that has passed both times.
+        let eid = ExecutionId::new();
+        scoped
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf".into(),
+                workflow_version: "0.1.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: json!({}),
+                current_state: json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        scoped
+            .append_event(jamjet_state::Event::new(
+                eid.clone(),
+                0,
+                jamjet_state::EventKind::ToolApprovalRequired {
+                    node_id: "gate".into(),
+                    tool_name: "t".into(),
+                    approver: "human".into(),
+                    context: json!({
+                        "expires_at": jamjet_state::approvals::format_deadline(&(now + chrono::Duration::seconds(600))),
+                        "escalate_at": jamjet_state::approvals::format_deadline(&(now + chrono::Duration::seconds(60))),
+                    }),
+                },
+            ))
+            .await
+            .unwrap();
+        // The scheduler runs on the unscoped backend, as in the server.
+        let scheduler =
+            jamjet_scheduler::Scheduler::new(base.clone() as Arc<dyn jamjet_state::StateBackend>)
+                .with_sealer(enricher.clone());
+        scheduler
+            .sweep_approval_deadlines(&eid, now + chrono::Duration::seconds(120))
+            .await
+            .unwrap();
+        scheduler
+            .sweep_approval_deadlines(&eid, now + chrono::Duration::seconds(700))
+            .await
+            .unwrap();
+
+        let b = base.clone();
+        let state = AppState {
+            backend: base.clone() as Arc<dyn jamjet_state::StateBackend>,
+            backend_for_fn: Arc::new(move |t: &TenantId| {
+                Arc::new(b.for_tenant(t.clone())) as Arc<dyn jamjet_state::StateBackend>
+            }),
+            agents: Arc::new(InMemoryAgentRegistry::new()),
+            audit,
+            enricher,
+            protocols: crate::state::default_protocol_registry(),
+            cron_store: None,
+            approval_policy: Default::default(),
+        };
+        let listed = |tenant: TenantId| {
+            let state = state.clone();
+            async move {
+                let Json(v) = list_audit_log(
+                    State(state),
+                    Extension(tenant),
+                    Query(AuditQueryParams {
+                        execution_id: None,
+                        actor_id: None,
+                        event_type: None,
+                        limit: 200,
+                        offset: 0,
+                    }),
+                )
+                .await
+                .unwrap();
+                v["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["event_type"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let mut for_acme = listed(acme).await;
+        for_acme.sort();
+        assert_eq!(for_acme, ["approval_escalated", "approval_expired"]);
+        assert!(
+            listed(TenantId::default()).await.is_empty(),
+            "the default tenant sees none of acme's records"
+        );
+    }
+
     /// The approve handler records a caller-chosen `user_id` only on the
     /// dev-mode router. Reached with neither a token nor the dev-mode marker
     /// (an auth layer missing by misconfiguration), it refuses rather than
@@ -2701,6 +2861,25 @@ mod tests {
         let tenant = TenantId::default();
         let backend = state.backend_for(&tenant);
         let eid = ExecutionId::new();
+        // A live run: a decision is recorded only on one.
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf".into(),
+                workflow_version: "0.1.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: json!({}),
+                current_state: json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
         // Started by someone, so separation of duties is not what refuses.
         backend
             .append_event(jamjet_state::Event::new(
