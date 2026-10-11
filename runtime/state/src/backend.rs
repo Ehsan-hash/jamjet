@@ -103,6 +103,28 @@ pub trait StateBackend: Send + Sync {
         status: WorkflowStatus,
     ) -> BackendResult<()>;
 
+    /// End a live execution: set its terminal `status` and append its
+    /// terminal `event` (`WorkflowCancelled`, `WorkflowCompleted`,
+    /// `WorkflowFailed`) as one atomic step. The event's sequence is assigned
+    /// here, like [`append_event`](Self::append_event).
+    ///
+    /// The status column and the event log are two records of one fact, and
+    /// [`commit_turn_unless_terminal`](Self::commit_turn_unless_terminal)
+    /// reads the status. Written apart, a fenced commit landing between the two
+    /// writes saw `Running` and recorded `NodeCompleted` after the terminal
+    /// event (PR #140 re-review, I-A). Written together, a commit sees either
+    /// neither or both.
+    ///
+    /// An execution that is already terminal is left untouched and its status
+    /// returned as [`ExecutionFinish::AlreadyTerminal`], so two racing
+    /// terminations record one terminal event, not two. A non-terminal
+    /// `status` is an error; an unknown execution is `NotFound`.
+    async fn finish_execution(
+        &self,
+        event: Event,
+        status: WorkflowStatus,
+    ) -> BackendResult<ExecutionFinish>;
+
     /// Update the current_state of a workflow execution (apply state patches).
     async fn update_execution_current_state(
         &self,
@@ -277,6 +299,38 @@ pub trait StateBackend: Send + Sync {
         lease_fence: i64,
     ) -> BackendResult<()>;
 
+    /// Claim with a lease of `lease_secs` seconds (the backend default, 30 s,
+    /// when `None`), which every renewal honours until the item settles. A
+    /// worker running ten-minute steps asks for a lease it can heartbeat
+    /// comfortably (PAS spike finding G9, 2026-09-06).
+    ///
+    /// Required, not defaulted: a default that ignored the length let a wrapper
+    /// hand out a 30 s lease while the claim route told the worker it held the
+    /// one it asked for. The length is bounded by [`granted_lease_secs`].
+    async fn claim_work_item_with_lease(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+    ) -> BackendResult<Option<WorkItem>>;
+
+    /// Renew the lease, or re-attach it when the presented fence was lost only
+    /// to expiry and nobody has claimed the item since, as after an engine
+    /// restart longer than the lease (PAS spike finding G8). The fence in the
+    /// answer is the one the worker must present from now on.
+    async fn heartbeat_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<LeaseRenewal> {
+        self.renew_lease(item_id, worker_id, lease_fence).await?;
+        Ok(LeaseRenewal {
+            lease_fence,
+            reattached: false,
+        })
+    }
+
     /// How many times this node has already completed in this execution.
     ///
     /// The `step` component of a tool-effect idempotency key. The default
@@ -386,6 +440,35 @@ pub trait StateBackend: Send + Sync {
         terminal_event: Event,
         write_snapshot: bool,
     ) -> BackendResult<EventSequence>;
+
+    /// [`commit_turn`](Self::commit_turn), unless the execution has reached a
+    /// terminal state (cancelled, completed, failed, limit exceeded). Then the
+    /// item is withdrawn instead, as [`withdraw_work_item_fenced`]
+    /// (Self::withdraw_work_item_fenced) does, and nothing is recorded.
+    ///
+    /// The status check is part of the commit's transaction, so a cancel
+    /// cannot land between the check and the write (PR #140 review, finding
+    /// I3). The fence is checked first either way: a stale or forged fence
+    /// returns `FenceLost` and touches nothing, terminal run or not.
+    async fn commit_turn_unless_terminal(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+        write_snapshot: bool,
+    ) -> BackendResult<TurnCommit>;
+
+    /// Settle a claimed work item as failed and record nothing, because its
+    /// execution is terminal and nobody wants its result. Fence-guarded like
+    /// every other settle: only the holder of a still-claimed item can
+    /// withdraw it, so `Ok(false)` for a stale or forged fence, an item that
+    /// already settled, or one never claimed. Memory drops the item; SQLite
+    /// marks it `'failed'`.
+    async fn withdraw_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool>;
 
     /// Atomically return a leased work item to `pending`, visible again at
     /// `retry_after`, with the attempt count set to `next_attempt` and a fresh
@@ -572,6 +655,67 @@ pub struct WorkItem {
     /// Tenant that owns this work item.
     #[serde(default = "default_tenant_string")]
     pub tenant_id: String,
+}
+
+/// The lease a claim gets when the worker does not say how long it needs.
+pub const DEFAULT_LEASE_SECS: u64 = 30;
+/// The shortest lease a claim may ask for: long enough to be renewable.
+pub const MIN_LEASE_SECS: u64 = 5;
+/// The longest lease a claim may ask for: short enough that a dead worker's
+/// item is not stranded for hours.
+pub const MAX_LEASE_SECS: u64 = 3600;
+
+/// The lease a claim is granted for what it asked: the default when it asked
+/// for nothing, otherwise the request held to `[MIN_LEASE_SECS,
+/// MAX_LEASE_SECS]`. Every backend applies it, and the claim route echoes it,
+/// so the worker paces its heartbeats from the lease it actually holds.
+pub fn granted_lease_secs(requested: Option<u64>) -> u64 {
+    requested.map_or(DEFAULT_LEASE_SECS, |s| {
+        s.clamp(MIN_LEASE_SECS, MAX_LEASE_SECS)
+    })
+}
+
+/// The lease epoch a fence was minted at. A fence is `term * 2^32 + epoch`,
+/// and every transition that takes a lease away or hands one out (claim,
+/// expiry, fail, park, re-attach) moves the item's epoch on by one.
+pub fn fence_epoch(lease_fence: i64) -> i64 {
+    lease_fence & 0xFFFF_FFFF
+}
+
+/// The epoch an item is at when the lease minted as `lost_fence` expired and
+/// NOTHING has happened to the item since. Re-attach requires exactly this:
+/// any later claim, failure or park has moved the epoch further, so a zombie
+/// cannot take back an item another worker claimed and then released (PR #140
+/// review, finding C1).
+pub fn epoch_after_expiry_of(lost_fence: i64) -> i64 {
+    fence_epoch(lost_fence) + 1
+}
+
+/// What [`StateBackend::finish_execution`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionFinish {
+    /// The status was set and the terminal event landed at this sequence.
+    Finished(EventSequence),
+    /// The execution was already terminal: nothing was written.
+    AlreadyTerminal(WorkflowStatus),
+}
+
+/// What [`StateBackend::commit_turn_unless_terminal`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnCommit {
+    /// The item settled and the terminal event landed at this sequence.
+    Committed(EventSequence),
+    /// The execution was already terminal: the item was withdrawn and nothing
+    /// was recorded.
+    ExecutionTerminal(WorkflowStatus),
+}
+
+/// What a heartbeat hands back: the fence the worker must present from now
+/// on, and whether the lease had to be re-attached after an expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRenewal {
+    pub lease_fence: i64,
+    pub reattached: bool,
 }
 
 /// Result of reclaiming expired work item leases.

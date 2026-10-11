@@ -13,6 +13,7 @@ No live runtime is required; a _StubClient records all outbound calls.
 
 from __future__ import annotations
 
+import time as _time
 from typing import Any
 
 import httpx
@@ -454,3 +455,168 @@ async def test_client_sends_a_present_key_even_when_falsy() -> None:
     )
     assert "idempotency_key" in sent, "a present key must be sent, not judged for truthiness"
     assert sent["idempotency_key"] == ""
+
+
+# ── Spike regressions, 2026-09-06 ─────────────────────────────────────────────
+#
+# (f) A synchronous handler (every torch call is one) used to run on the event
+#     loop, so the heartbeat task never ran, the 30 s lease lapsed, and the
+#     step was re-run by the same worker until it was dead-lettered.
+# (g) A cancel never reached a running worker. The heartbeat now carries
+#     `cancel_requested`; the worker exposes it to the handler, stops waiting
+#     for the result, and reports nothing for the abandoned item.
+
+
+def _sleep_sync(input: dict) -> dict:
+    """Blocks the calling thread like a model inference call does."""
+    _time.sleep(0.5)
+    return {"slept": True}
+
+
+def _until_cancelled(input: dict) -> dict:
+    """Runs until the worker signals cancel, as a well-behaved GPU step would."""
+    from jamjet.worker_context import current_work
+
+    ctx = current_work()
+    deadline = _time.monotonic() + 3.0
+    while not ctx.cancel_requested.is_set() and _time.monotonic() < deadline:
+        _time.sleep(0.02)
+    return {"saw_cancel": ctx.cancel_requested.is_set()}
+
+
+_SLEEP_SYNC_ITEM: dict = {
+    "id": "wi-sync",
+    "execution_id": "exec_sync",
+    "node_id": "gpu_step",
+    "queue_type": "python_tool",
+    "payload": {"module": "tests.test_worker", "function": "_sleep_sync", "input": {}},
+    "lease_fence": 7,
+}
+
+_CANCEL_ITEM: dict = {
+    "id": "wi-cancel",
+    "execution_id": "exec_cancel",
+    "node_id": "gpu_step",
+    "queue_type": "python_tool",
+    "payload": {"module": "tests.test_worker", "function": "_until_cancelled", "input": {}},
+    "lease_fence": 8,
+}
+
+
+class _CancellingClient(_StubClient):
+    """Stub whose heartbeat answers as the engine does after a cancel."""
+
+    async def heartbeat_work_item(self, item_id: str, worker_id: str, lease_fence: int = 0) -> dict:
+        self.heartbeat_calls.append({"item_id": item_id, "lease_fence": lease_fence})
+        return {"renewed": True, "cancel_requested": True}
+
+
+async def test_worker_keeps_heartbeating_while_a_sync_handler_blocks() -> None:
+    """(f) Heartbeats must flow while a synchronous handler runs."""
+    stub = _StubClient(claimed_item=_SLEEP_SYNC_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True, heartbeat_interval_s=0.1)
+
+    assert len(stub.heartbeat_calls) >= 2, (
+        f"a 0.5 s sync handler with a 0.1 s heartbeat interval must heartbeat, got {len(stub.heartbeat_calls)}"
+    )
+    assert stub.heartbeat_calls[0]["lease_fence"] == 7
+    assert len(stub.complete_calls) == 1 and stub.complete_calls[0]["output"] == {"slept": True}
+
+
+async def test_worker_abandons_the_item_when_the_heartbeat_reports_cancel() -> None:
+    """(g) On cancel_requested the handler sees the flag and nothing is reported."""
+    stub = _CancellingClient(claimed_item=_CANCEL_ITEM)
+    started = _time.monotonic()
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True, heartbeat_interval_s=0.05)
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 2.0, f"the worker must stop waiting once cancelled, took {elapsed:.2f}s"
+    assert stub.complete_calls == [], "a cancelled item's result must not be reported"
+    assert stub.fail_calls == [], "a cancelled item is not a failure either"
+
+
+# (h) Lease length and re-attach, spike findings G8 and G9 (2026-09-06).
+
+
+class _LeaseRecordingClient(_StubClient):
+    """Records the lease a claim asks for, and answers heartbeats with a new fence
+    the way the engine does after re-attaching an expired lease."""
+
+    def __init__(self, *, claimed_item: dict | None = None, reattach_fence: int | None = None) -> None:
+        super().__init__(claimed_item=claimed_item)
+        self.claim_lease_secs: list[int | None] = []
+        self._reattach_fence = reattach_fence
+
+    async def claim_work_item(
+        self, worker_id: str, queue_types: list[str], lease_secs: int | None = None
+    ) -> dict | None:
+        self.claim_lease_secs.append(lease_secs)
+        return self._claimed_item
+
+    async def heartbeat_work_item(self, item_id: str, worker_id: str, lease_fence: int = 0) -> dict:
+        self.heartbeat_calls.append({"item_id": item_id, "lease_fence": lease_fence})
+        if self._reattach_fence is not None:
+            return {"renewed": True, "cancel_requested": False, "lease_fence": self._reattach_fence, "reattached": True}
+        return {"renewed": True, "cancel_requested": False}
+
+
+async def test_worker_asks_for_the_lease_it_was_configured_with() -> None:
+    stub = _LeaseRecordingClient(claimed_item=_ADD_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True, lease_secs=600)
+    assert stub.claim_lease_secs == [600]
+
+
+async def test_worker_completes_with_the_fence_a_reattaching_heartbeat_returned() -> None:
+    item = dict(_SLEEP_SYNC_ITEM, lease_fence=11)
+    stub = _LeaseRecordingClient(claimed_item=item, reattach_fence=12)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True, heartbeat_interval_s=0.1)
+    assert len(stub.heartbeat_calls) >= 1
+    assert stub.complete_calls[0]["lease_fence"] == 12, "after a re-attach the completion must carry the new fence"
+
+
+# (i) PR #140 review, finding I5: the worker paced its heartbeats from the lease
+#     it ASKED for, not the one the engine granted. Asking for 20000 s against
+#     the engine's 3600 s ceiling meant a heartbeat every 6667 s: the lease
+#     always lapsed first, a second worker claimed, and the step ran twice.
+
+
+def _sleep_long_sync(input: dict) -> dict:
+    _time.sleep(1.6)
+    return {"slept": True}
+
+
+async def test_worker_paces_heartbeats_from_the_granted_lease() -> None:
+    item = dict(
+        _SLEEP_SYNC_ITEM,
+        payload={"module": "tests.test_worker", "function": "_sleep_long_sync", "input": {}},
+        # The engine held the request to its bounds and says so in the answer.
+        lease_secs=3,
+    )
+    stub = _LeaseRecordingClient(claimed_item=item)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True, lease_secs=20000)
+
+    assert stub.claim_lease_secs == [20000]
+    assert len(stub.heartbeat_calls) >= 1, (
+        "a 3 s granted lease must be heartbeated about every second, not at a third of the 20000 s the worker asked for"
+    )
+
+
+def test_worker_cli_refuses_a_lease_outside_the_engine_bounds(monkeypatch: Any) -> None:
+    from typer.testing import CliRunner
+
+    import jamjet.cli.main as cli
+
+    started: list[int | None] = []
+
+    async def _no_loop(*args: Any, lease_secs: int | None = None, **kwargs: Any) -> None:
+        started.append(lease_secs)
+
+    # Never poll a real runtime: an accepted flag just records what it got.
+    monkeypatch.setattr(cli, "_worker_loop", _no_loop)
+    for bad in ("0", "4", "3601", "20000"):
+        result = CliRunner().invoke(cli.app, ["worker", "--once", "--lease-secs", bad])
+        assert result.exit_code == 2, f"--lease-secs {bad} must be refused, got {result.exit_code}: {result.output}"
+    assert started == [], f"a refused flag must not start the worker, started with {started}"
+    result = CliRunner().invoke(cli.app, ["worker", "--once", "--lease-secs", "600"])
+    assert result.exit_code == 0, result.output
+    assert started == [600]

@@ -7,11 +7,14 @@
 
 use crate::backend::{
     ApiToken, BackendResult, FailOutcome, ReclaimResult, ReserveOutcome, StateBackend,
-    StateBackendError, WorkItem, WorkItemId, WorkflowDefinition,
+    StateBackendError, TurnCommit, WorkItem, WorkItemId, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
-use crate::sqlite::{map_db_err, parse_datetime, parse_execution_id};
+use crate::sqlite::{
+    expire_stale_leases, lease_secs_for, map_db_err, parse_datetime, parse_execution_id,
+    reattach_lease, terminal_status_of, withdraw_claimed_item,
+};
 use crate::tenant::{Tenant, TenantId, TenantLimits, TenantStatus, DEFAULT_TENANT};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -190,6 +193,297 @@ fn row_to_work_item(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkItem> {
 
 // ── StateBackend impl ─────────────────────────────────────────────────────────
 
+impl TenantScopedSqliteBackend {
+    #[instrument(skip(self, terminal_event), fields(tenant = %self.tenant_id, item_id = %item_id))]
+    /// The one commit both `commit_turn` and `commit_turn_unless_terminal`
+    /// run. With `refuse_terminal`, the execution's status is read inside the
+    /// transaction, after `BEGIN IMMEDIATE` took the write lock, so a cancel
+    /// either committed before this read or waits until after this commit.
+    async fn commit_turn_inner(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+        write_snapshot: bool,
+        refuse_terminal: bool,
+    ) -> BackendResult<TurnCommit> {
+        let id_str = item_id.to_string();
+        let execution_id = execution_id_str(&terminal_event.execution_id);
+        let event_id = terminal_event.id.to_string();
+        let kind_json = serde_json::to_string(&terminal_event.kind)?;
+        let created_at = terminal_event.created_at.to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+
+        // Validate terminal event kind BEFORE opening the transaction.
+        // A miswired caller (non-terminal event) fails loud instead of
+        // silently settling a non-terminal event as completed.
+        let (status, set_completed_at) = match &terminal_event.kind {
+            EventKind::NodeCompleted { .. } => ("completed", true),
+            EventKind::NodeFailed { .. } => ("failed", false),
+            _ => {
+                return Err(StateBackendError::Database(
+                    "commit_turn requires a terminal event (NodeCompleted/NodeFailed)".into(),
+                ))
+            }
+        };
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        if refuse_terminal {
+            if let Some(status) =
+                terminal_status_of(&mut tx, Some(&self.tenant_id.0), &execution_id).await?
+            {
+                // Fence first: only the holder may withdraw, and a stale or
+                // forged fence must leave the item exactly as it is.
+                if !withdraw_claimed_item(&mut tx, Some(&self.tenant_id.0), &id_str, lease_fence)
+                    .await?
+                {
+                    tx.rollback().await.map_err(map_db_err)?;
+                    return Err(StateBackendError::FenceLost(id_str));
+                }
+                tx.commit().await.map_err(map_db_err)?;
+                return Ok(TurnCommit::ExecutionTerminal(status));
+            }
+        }
+
+        // Fenced settle with tenant isolation. Zero rows => stale fence => fail closed.
+        let rows = if set_completed_at {
+            sqlx::query(
+                "UPDATE work_items SET status = ?, completed_at = ?, lease_expires_at = NULL \
+                 WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
+            )
+            .bind(status)
+            .bind(&now)
+            .bind(&id_str)
+            .bind(&self.tenant_id.0)
+            .bind(lease_fence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE work_items SET status = ?, completed_at = NULL, lease_expires_at = NULL, worker_id = NULL \
+                 WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
+            )
+            .bind(status)
+            .bind(&id_str)
+            .bind(&self.tenant_id.0)
+            .bind(lease_fence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .rows_affected()
+        };
+
+        if rows == 0 {
+            tx.rollback().await.map_err(map_db_err)?;
+            return Err(StateBackendError::FenceLost(id_str));
+        }
+
+        let seq_row = sqlx::query(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
+        )
+        .bind(&execution_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+
+        sqlx::query(
+            r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&event_id)
+        .bind(&execution_id)
+        .bind(sequence)
+        .bind(&kind_json)
+        .bind(&created_at)
+        .bind(&self.tenant_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        // 2b) If the terminal event is NodeCompleted with an idempotency key,
+        //     record the result in tool_effects in the SAME transaction (tenant-scoped).
+        //     INSERT OR IGNORE — a concurrent winner already recorded it.
+        if let EventKind::NodeCompleted {
+            node_id: ref nc_node_id,
+            ref output,
+            ref state_patch,
+            duration_ms,
+            ref gen_ai_system,
+            ref gen_ai_model,
+            input_tokens,
+            output_tokens,
+            ref finish_reason,
+            idempotency_key: Some(ref idem_key),
+            ..
+        } = terminal_event.kind
+        {
+            let result_json = serde_json::json!({
+                "output": output,
+                "state_patch": state_patch,
+                "duration_ms": duration_ms,
+                "gen_ai_system": gen_ai_system,
+                "gen_ai_model": gen_ai_model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "finish_reason": finish_reason,
+            });
+            let result_json_str = serde_json::to_string(&result_json)?;
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO tool_effects
+                   (idempotency_key, execution_id, node_id, result_json, tenant_id, recorded_at)
+                   VALUES (?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(idem_key)
+            .bind(&execution_id)
+            .bind(nc_node_id.as_str())
+            .bind(&result_json_str)
+            .bind(&self.tenant_id.0)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+        }
+
+        // Optionally compute and write the snapshot IN-TX from committed state (tenant-scoped).
+        // BEGIN IMMEDIATE serializes writers — no concurrent write-skew.
+        if write_snapshot {
+            // 3a. Read the latest snapshot for this execution IN-TX.
+            let snap_row = sqlx::query(
+                "SELECT * FROM snapshots WHERE execution_id = ? AND tenant_id = ? ORDER BY at_sequence DESC LIMIT 1",
+            )
+            .bind(&execution_id)
+            .bind(&self.tenant_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+
+            let (base, base_sequence) = if let Some(row) = snap_row {
+                let at_seq: i64 = row.try_get("at_sequence").map_err(map_db_err)?;
+                let current_state: serde_json::Value =
+                    serde_json::from_str(row.try_get::<&str, _>("state_json").map_err(map_db_err)?)
+                        .map_err(StateBackendError::Serialization)?;
+                let snap_status =
+                    str_to_status(row.try_get::<&str, _>("status").unwrap_or("running"))
+                        .unwrap_or(WorkflowStatus::Running);
+                let completed_nodes: std::collections::HashMap<String, serde_json::Value> = {
+                    match row.try_get::<Option<&str>, _>("completed_nodes_json") {
+                        Err(_) => std::collections::HashMap::new(),
+                        Ok(None) => std::collections::HashMap::new(),
+                        Ok(Some(s)) => {
+                            serde_json::from_str(s).map_err(StateBackendError::Serialization)?
+                        }
+                    }
+                };
+                let active_nodes: std::collections::HashSet<String> = {
+                    match row.try_get::<Option<&str>, _>("active_nodes_json") {
+                        Err(_) => std::collections::HashSet::new(),
+                        Ok(None) => std::collections::HashSet::new(),
+                        Ok(Some(s)) => {
+                            serde_json::from_str(s).map_err(StateBackendError::Serialization)?
+                        }
+                    }
+                };
+                let last_seq: i64 = row.try_get::<i64, _>("last_sequence").unwrap_or(at_seq);
+                (
+                    crate::materializer::MaterializedState {
+                        current_state,
+                        status: snap_status,
+                        completed_nodes,
+                        active_nodes,
+                        last_sequence: last_seq,
+                    },
+                    at_seq,
+                )
+            } else {
+                // No snapshot: seed from the execution's initial_input IN-TX.
+                let exec_row = sqlx::query(
+                    "SELECT initial_input FROM workflow_executions WHERE execution_id = ? AND tenant_id = ?",
+                )
+                .bind(&execution_id)
+                .bind(&self.tenant_id.0)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(map_db_err)?;
+                let initial_input: serde_json::Value = serde_json::from_str(
+                    exec_row
+                        .try_get::<&str, _>("initial_input")
+                        .map_err(map_db_err)?,
+                )
+                .map_err(StateBackendError::Serialization)?;
+                (
+                    crate::materializer::MaterializedState {
+                        current_state: initial_input,
+                        status: WorkflowStatus::Pending,
+                        completed_nodes: std::collections::HashMap::new(),
+                        active_nodes: std::collections::HashSet::new(),
+                        last_sequence: 0,
+                    },
+                    0,
+                )
+            };
+
+            // 3b. Read events since base_sequence IN-TX (includes the just-inserted terminal event).
+            let event_rows = sqlx::query(
+                "SELECT * FROM events WHERE execution_id = ? AND tenant_id = ? AND sequence > ? ORDER BY sequence ASC",
+            )
+            .bind(&execution_id)
+            .bind(&self.tenant_id.0)
+            .bind(base_sequence)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+
+            let tail_events: Vec<crate::event::Event> = event_rows
+                .iter()
+                .map(row_to_event)
+                .collect::<BackendResult<Vec<_>>>()?;
+
+            // 3c. Fold events onto the base state.
+            let mat = crate::materializer::apply_events_seeded(base, &tail_events);
+
+            // 3d. Build and INSERT the snapshot.
+            let snap = Snapshot::from_materialized(terminal_event.execution_id.clone(), &mat);
+            let snap_id = snap.id.to_string();
+            let snap_exec_id = execution_id_str(&snap.execution_id);
+            let snap_state_json = serde_json::to_string(&snap.state)?;
+            let snap_created_at = snap.created_at.to_rfc3339();
+            let snap_status_str = status_to_str(&snap.status);
+            let snap_completed_json = serde_json::to_string(&snap.completed_nodes)?;
+            let snap_active_json = serde_json::to_string(&snap.active_nodes)?;
+
+            sqlx::query(
+                r#"INSERT OR REPLACE INTO snapshots
+                   (id, execution_id, at_sequence, state_json, created_at, tenant_id, status, completed_nodes_json, active_nodes_json, last_sequence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&snap_id)
+            .bind(&snap_exec_id)
+            .bind(snap.at_sequence)
+            .bind(&snap_state_json)
+            .bind(&snap_created_at)
+            .bind(&self.tenant_id.0)
+            .bind(snap_status_str)
+            .bind(&snap_completed_json)
+            .bind(&snap_active_json)
+            .bind(snap.last_sequence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+        }
+
+        tx.commit().await.map_err(map_db_err)?;
+        Ok(TurnCommit::Committed(sequence))
+    }
+}
+
 #[async_trait]
 impl StateBackend for TenantScopedSqliteBackend {
     // ── Workflow definitions ──────────────────────────────────────────────
@@ -302,6 +596,15 @@ impl StateBackend for TenantScopedSqliteBackend {
         .map_err(map_db_err)?;
 
         row.map(|r| row_to_execution(&r)).transpose()
+    }
+
+    #[instrument(skip(self, event), fields(tenant = %self.tenant_id, execution_id = %event.execution_id))]
+    async fn finish_execution(
+        &self,
+        event: Event,
+        status: WorkflowStatus,
+    ) -> BackendResult<crate::backend::ExecutionFinish> {
+        crate::sqlite::finish_execution_in(&self.pool, Some(&self.tenant_id.0), event, status).await
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %id))]
@@ -976,34 +1279,25 @@ impl StateBackend for TenantScopedSqliteBackend {
         worker_id: &str,
         queue_types: &[&str],
     ) -> BackendResult<Option<WorkItem>> {
+        self.claim_work_item_with_lease(worker_id, queue_types, None)
+            .await
+    }
+
+    async fn claim_work_item_with_lease(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+    ) -> BackendResult<Option<WorkItem>> {
         if queue_types.is_empty() {
             return Ok(None);
         }
 
+        // Re-queue this tenant's expired leases, recording the retry, before
+        // looking for work.
+        expire_stale_leases(&self.pool, Some(&self.tenant_id.0)).await?;
         let now = Utc::now().to_rfc3339();
-        // Expire stale leases for this tenant; bump lease_epoch so a re-claim
-        // mints a strictly greater fence than any zombie worker's stale token.
-        sqlx::query(
-            // `attempt + 1` and the max_attempts bound mirror the untenanted
-            // backend: without the increment a node that reliably kills its
-            // worker is resurrected forever at attempt 0, because this fast path
-            // out-races the reclaim sweep that is the only other place attempts
-            // move. An item whose budget is spent stays 'claimed' with an expired
-            // lease, which is exactly what the sweep selects, so it dead-letters
-            // there WITH the NodeFailed only the sweep's caller emits.
-            "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL, \
-             lease_epoch = lease_epoch + 1, lease_fence = 0, attempt = attempt + 1 \
-             WHERE status = 'claimed' AND lease_expires_at < ? AND tenant_id = ? \
-               AND attempt + 1 < max_attempts",
-        )
-        .bind(&now)
-        .bind(&self.tenant_id.0)
-        .execute(&self.pool)
-        .await
-        .map_err(map_db_err)?;
 
-        // BEGIN IMMEDIATE: see SqliteBackend::append_event — a deferred
-        // SELECT→UPDATE upgrade hits an instant SQLITE_BUSY under concurrency.
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -1035,7 +1329,8 @@ impl StateBackend for TenantScopedSqliteBackend {
 
         let item = row_to_work_item(&row)?;
         let item_id = item.id.to_string();
-        let lease_expires_at = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        let lease_len = crate::backend::granted_lease_secs(lease_secs) as i64;
+        let lease_expires_at = (Utc::now() + chrono::Duration::seconds(lease_len)).to_rfc3339();
         let claimed_at = Utc::now().to_rfc3339();
 
         let term = self.current_term(&mut tx).await?;
@@ -1044,13 +1339,14 @@ impl StateBackend for TenantScopedSqliteBackend {
         let new_fence = term * 4_294_967_296_i64 + new_epoch;
 
         sqlx::query(
-            "UPDATE work_items SET status = 'claimed', worker_id = ?, lease_expires_at = ?, claimed_at = ?, lease_epoch = ?, lease_fence = ? WHERE id = ?",
+            "UPDATE work_items SET status = 'claimed', worker_id = ?, lease_expires_at = ?, claimed_at = ?, lease_epoch = ?, lease_fence = ?, lease_secs = ? WHERE id = ?",
         )
         .bind(worker_id)
         .bind(&lease_expires_at)
         .bind(&claimed_at)
         .bind(new_epoch)
         .bind(new_fence)
+        .bind(lease_len)
         .bind(&item_id)
         .execute(&mut *tx)
         .await
@@ -1099,8 +1395,9 @@ impl StateBackend for TenantScopedSqliteBackend {
         worker_id: &str,
         lease_fence: i64,
     ) -> BackendResult<()> {
-        let lease_expires_at = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
         let id_str = item_id.to_string();
+        let lease_len = lease_secs_for(&self.pool, &id_str).await?;
+        let lease_expires_at = (Utc::now() + chrono::Duration::seconds(lease_len)).to_rfc3339();
 
         let rows_affected = sqlx::query(
             "UPDATE work_items SET lease_expires_at = ? WHERE id = ? AND worker_id = ? AND status = 'claimed' AND tenant_id = ? AND lease_fence = ?",
@@ -1119,6 +1416,31 @@ impl StateBackend for TenantScopedSqliteBackend {
             return Err(StateBackendError::FenceLost(id_str));
         }
         Ok(())
+    }
+
+    async fn heartbeat_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<crate::backend::LeaseRenewal> {
+        match self.renew_lease(item_id, worker_id, lease_fence).await {
+            Ok(()) => Ok(crate::backend::LeaseRenewal {
+                lease_fence,
+                reattached: false,
+            }),
+            Err(StateBackendError::FenceLost(_)) => {
+                reattach_lease(
+                    &self.pool,
+                    Some(&self.tenant_id.0),
+                    item_id,
+                    worker_id,
+                    lease_fence,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, item_id = %item_id))]
@@ -1403,7 +1725,6 @@ impl StateBackend for TenantScopedSqliteBackend {
         Ok(true)
     }
 
-    #[instrument(skip(self, terminal_event), fields(tenant = %self.tenant_id, item_id = %item_id))]
     async fn commit_turn(
         &self,
         item_id: WorkItemId,
@@ -1411,263 +1732,42 @@ impl StateBackend for TenantScopedSqliteBackend {
         terminal_event: Event,
         write_snapshot: bool,
     ) -> BackendResult<EventSequence> {
-        let id_str = item_id.to_string();
-        let execution_id = execution_id_str(&terminal_event.execution_id);
-        let event_id = terminal_event.id.to_string();
-        let kind_json = serde_json::to_string(&terminal_event.kind)?;
-        let created_at = terminal_event.created_at.to_rfc3339();
-        let now = Utc::now().to_rfc3339();
-
-        // Validate terminal event kind BEFORE opening the transaction.
-        // A miswired caller (non-terminal event) fails loud instead of
-        // silently settling a non-terminal event as completed.
-        let (status, set_completed_at) = match &terminal_event.kind {
-            EventKind::NodeCompleted { .. } => ("completed", true),
-            EventKind::NodeFailed { .. } => ("failed", false),
-            _ => {
-                return Err(StateBackendError::Database(
-                    "commit_turn requires a terminal event (NodeCompleted/NodeFailed)".into(),
-                ))
-            }
-        };
-
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(map_db_err)?;
-
-        // Fenced settle with tenant isolation. Zero rows => stale fence => fail closed.
-        let rows = if set_completed_at {
-            sqlx::query(
-                "UPDATE work_items SET status = ?, completed_at = ?, lease_expires_at = NULL \
-                 WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
-            )
-            .bind(status)
-            .bind(&now)
-            .bind(&id_str)
-            .bind(&self.tenant_id.0)
-            .bind(lease_fence)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_db_err)?
-            .rows_affected()
-        } else {
-            sqlx::query(
-                "UPDATE work_items SET status = ?, completed_at = NULL, lease_expires_at = NULL, worker_id = NULL \
-                 WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
-            )
-            .bind(status)
-            .bind(&id_str)
-            .bind(&self.tenant_id.0)
-            .bind(lease_fence)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_db_err)?
-            .rows_affected()
-        };
-
-        if rows == 0 {
-            tx.rollback().await.map_err(map_db_err)?;
-            return Err(StateBackendError::FenceLost(id_str));
-        }
-
-        let seq_row = sqlx::query(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
-        )
-        .bind(&execution_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_db_err)?;
-        let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
-
-        sqlx::query(
-            r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id)
-               VALUES (?, ?, ?, ?, ?, ?)"#,
-        )
-        .bind(&event_id)
-        .bind(&execution_id)
-        .bind(sequence)
-        .bind(&kind_json)
-        .bind(&created_at)
-        .bind(&self.tenant_id.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_db_err)?;
-
-        // 2b) If the terminal event is NodeCompleted with an idempotency key,
-        //     record the result in tool_effects in the SAME transaction (tenant-scoped).
-        //     INSERT OR IGNORE — a concurrent winner already recorded it.
-        if let EventKind::NodeCompleted {
-            node_id: ref nc_node_id,
-            ref output,
-            ref state_patch,
-            duration_ms,
-            ref gen_ai_system,
-            ref gen_ai_model,
-            input_tokens,
-            output_tokens,
-            ref finish_reason,
-            idempotency_key: Some(ref idem_key),
-            ..
-        } = terminal_event.kind
+        match self
+            .commit_turn_inner(item_id, lease_fence, terminal_event, write_snapshot, false)
+            .await?
         {
-            let result_json = serde_json::json!({
-                "output": output,
-                "state_patch": state_patch,
-                "duration_ms": duration_ms,
-                "gen_ai_system": gen_ai_system,
-                "gen_ai_model": gen_ai_model,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "finish_reason": finish_reason,
-            });
-            let result_json_str = serde_json::to_string(&result_json)?;
-            sqlx::query(
-                r#"INSERT OR IGNORE INTO tool_effects
-                   (idempotency_key, execution_id, node_id, result_json, tenant_id, recorded_at)
-                   VALUES (?, ?, ?, ?, ?, ?)"#,
-            )
-            .bind(idem_key)
-            .bind(&execution_id)
-            .bind(nc_node_id.as_str())
-            .bind(&result_json_str)
-            .bind(&self.tenant_id.0)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_db_err)?;
+            TurnCommit::Committed(sequence) => Ok(sequence),
+            // Unreachable: the terminal check runs only when asked for.
+            TurnCommit::ExecutionTerminal(status) => Err(StateBackendError::Database(format!(
+                "commit_turn refused for a {status:?} execution"
+            ))),
         }
+    }
 
-        // Optionally compute and write the snapshot IN-TX from committed state (tenant-scoped).
-        // BEGIN IMMEDIATE serializes writers — no concurrent write-skew.
-        if write_snapshot {
-            // 3a. Read the latest snapshot for this execution IN-TX.
-            let snap_row = sqlx::query(
-                "SELECT * FROM snapshots WHERE execution_id = ? AND tenant_id = ? ORDER BY at_sequence DESC LIMIT 1",
-            )
-            .bind(&execution_id)
-            .bind(&self.tenant_id.0)
-            .fetch_optional(&mut *tx)
+    async fn commit_turn_unless_terminal(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+        write_snapshot: bool,
+    ) -> BackendResult<TurnCommit> {
+        self.commit_turn_inner(item_id, lease_fence, terminal_event, write_snapshot, true)
             .await
-            .map_err(map_db_err)?;
+    }
 
-            let (base, base_sequence) = if let Some(row) = snap_row {
-                let at_seq: i64 = row.try_get("at_sequence").map_err(map_db_err)?;
-                let current_state: serde_json::Value =
-                    serde_json::from_str(row.try_get::<&str, _>("state_json").map_err(map_db_err)?)
-                        .map_err(StateBackendError::Serialization)?;
-                let snap_status =
-                    str_to_status(row.try_get::<&str, _>("status").unwrap_or("running"))
-                        .unwrap_or(WorkflowStatus::Running);
-                let completed_nodes: std::collections::HashMap<String, serde_json::Value> = {
-                    match row.try_get::<Option<&str>, _>("completed_nodes_json") {
-                        Err(_) => std::collections::HashMap::new(),
-                        Ok(None) => std::collections::HashMap::new(),
-                        Ok(Some(s)) => {
-                            serde_json::from_str(s).map_err(StateBackendError::Serialization)?
-                        }
-                    }
-                };
-                let active_nodes: std::collections::HashSet<String> = {
-                    match row.try_get::<Option<&str>, _>("active_nodes_json") {
-                        Err(_) => std::collections::HashSet::new(),
-                        Ok(None) => std::collections::HashSet::new(),
-                        Ok(Some(s)) => {
-                            serde_json::from_str(s).map_err(StateBackendError::Serialization)?
-                        }
-                    }
-                };
-                let last_seq: i64 = row.try_get::<i64, _>("last_sequence").unwrap_or(at_seq);
-                (
-                    crate::materializer::MaterializedState {
-                        current_state,
-                        status: snap_status,
-                        completed_nodes,
-                        active_nodes,
-                        last_sequence: last_seq,
-                    },
-                    at_seq,
-                )
-            } else {
-                // No snapshot: seed from the execution's initial_input IN-TX.
-                let exec_row = sqlx::query(
-                    "SELECT initial_input FROM workflow_executions WHERE execution_id = ? AND tenant_id = ?",
-                )
-                .bind(&execution_id)
-                .bind(&self.tenant_id.0)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(map_db_err)?;
-                let initial_input: serde_json::Value = serde_json::from_str(
-                    exec_row
-                        .try_get::<&str, _>("initial_input")
-                        .map_err(map_db_err)?,
-                )
-                .map_err(StateBackendError::Serialization)?;
-                (
-                    crate::materializer::MaterializedState {
-                        current_state: initial_input,
-                        status: WorkflowStatus::Pending,
-                        completed_nodes: std::collections::HashMap::new(),
-                        active_nodes: std::collections::HashSet::new(),
-                        last_sequence: 0,
-                    },
-                    0,
-                )
-            };
-
-            // 3b. Read events since base_sequence IN-TX (includes the just-inserted terminal event).
-            let event_rows = sqlx::query(
-                "SELECT * FROM events WHERE execution_id = ? AND tenant_id = ? AND sequence > ? ORDER BY sequence ASC",
-            )
-            .bind(&execution_id)
-            .bind(&self.tenant_id.0)
-            .bind(base_sequence)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(map_db_err)?;
-
-            let tail_events: Vec<crate::event::Event> = event_rows
-                .iter()
-                .map(row_to_event)
-                .collect::<BackendResult<Vec<_>>>()?;
-
-            // 3c. Fold events onto the base state.
-            let mat = crate::materializer::apply_events_seeded(base, &tail_events);
-
-            // 3d. Build and INSERT the snapshot.
-            let snap = Snapshot::from_materialized(terminal_event.execution_id.clone(), &mat);
-            let snap_id = snap.id.to_string();
-            let snap_exec_id = execution_id_str(&snap.execution_id);
-            let snap_state_json = serde_json::to_string(&snap.state)?;
-            let snap_created_at = snap.created_at.to_rfc3339();
-            let snap_status_str = status_to_str(&snap.status);
-            let snap_completed_json = serde_json::to_string(&snap.completed_nodes)?;
-            let snap_active_json = serde_json::to_string(&snap.active_nodes)?;
-
-            sqlx::query(
-                r#"INSERT OR REPLACE INTO snapshots
-                   (id, execution_id, at_sequence, state_json, created_at, tenant_id, status, completed_nodes_json, active_nodes_json, last_sequence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-            )
-            .bind(&snap_id)
-            .bind(&snap_exec_id)
-            .bind(snap.at_sequence)
-            .bind(&snap_state_json)
-            .bind(&snap_created_at)
-            .bind(&self.tenant_id.0)
-            .bind(snap_status_str)
-            .bind(&snap_completed_json)
-            .bind(&snap_active_json)
-            .bind(snap.last_sequence)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_db_err)?;
-        }
-
-        tx.commit().await.map_err(map_db_err)?;
-        Ok(sequence)
+    async fn withdraw_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        let mut conn = self.pool.acquire().await.map_err(map_db_err)?;
+        withdraw_claimed_item(
+            &mut conn,
+            Some(&self.tenant_id.0),
+            &item_id.to_string(),
+            lease_fence,
+        )
+        .await
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id))]
@@ -1754,7 +1854,8 @@ impl StateBackend for TenantScopedSqliteBackend {
                 // token so the worker that just lost this item cannot park over
                 // the requeued attempt.
                 let rows = sqlx::query(
-                    "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, \
+                    "UPDATE work_items SET status = 'pending', attempt = ?, last_worker_id = worker_id, \
+                     last_lease_fence = lease_fence, worker_id = NULL, lease_expires_at = NULL, \
                      retry_after = ?, lease_epoch = lease_epoch + 1, lease_fence = 0 \
                      WHERE id = ? AND tenant_id = ? AND status = 'claimed'",
                 )

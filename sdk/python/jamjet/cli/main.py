@@ -1762,19 +1762,53 @@ async def _worker_loop(
     queues: list[str],
     *,
     once: bool = False,
+    heartbeat_interval_s: float | None = None,
+    lease_secs: int | None = None,
 ) -> None:
     """Core python_tool worker polling loop, separated for testability.
 
     Claim work items from *queues*, resolve the handler named by
     ``payload["module"]`` / ``payload["function"]``, invoke it with
     ``payload["input"]``, and post complete / fail back to the runtime.
-    Heartbeats are sent every 10 seconds while the handler is running.
+    ``lease_secs`` is the lease the worker asks the engine for on every claim
+    (the engine default, 30 s, when ``None``); a worker running long steps
+    asks for what it can heartbeat comfortably. Heartbeats are sent every
+    ``heartbeat_interval_s`` seconds, by default a third of the lease the
+    engine granted (the claim answer's ``lease_secs``), from a task on the
+    event loop. A heartbeat answer that carries a new
+    ``lease_fence`` means the engine re-attached a lease that had expired
+    while it was unreachable; the worker completes with that fence. A synchronous handler
+    therefore runs in a worker thread (``asyncio.to_thread``), never on the
+    loop: on 2026-09-06 a blocking 50 s handler starved the heartbeat, the
+    30 s lease lapsed, and the step was re-run until it was dead-lettered.
+
+    The engine answers a heartbeat with ``cancel_requested`` once the
+    execution is cancelled. The worker then sets ``cancel_requested`` on the
+    handler's :class:`~jamjet.worker_context.WorkContext`, stops waiting for
+    the result, and reports nothing for the item.
     """
     import importlib as _importlib
 
+    from jamjet.worker_context import WorkContext, reset_current_work, set_current_work
+
+    def _heartbeat_interval(work_item: dict[str, Any]) -> float:
+        # Pace from the lease the engine GRANTED, which it echoes in the claim
+        # answer and which may differ from the one asked for (it holds requests
+        # to [5, 3600] s). Pacing from the request let a worker that asked for
+        # 20000 s heartbeat every 6667 s against a 3600 s lease.
+        if heartbeat_interval_s is not None:
+            return heartbeat_interval_s
+        granted = work_item.get("lease_secs")
+        if not isinstance(granted, (int, float)) or isinstance(granted, bool) or granted <= 0:
+            granted = lease_secs or 30
+        return max(1.0, granted / 3)
+
     while True:
         try:
-            work_item = await client.claim_work_item(worker_id, queues)
+            if lease_secs is not None:
+                work_item = await client.claim_work_item(worker_id, queues, lease_secs=lease_secs)
+            else:
+                work_item = await client.claim_work_item(worker_id, queues)
             if work_item is None:
                 if once:
                     return
@@ -1785,20 +1819,43 @@ async def _worker_loop(
             exec_id: str = work_item["execution_id"]
             node_id: str = work_item["node_id"]
             payload: dict[str, Any] = work_item.get("payload", {})
-            lease_fence: int = work_item.get("lease_fence", 0)
+            # The fence can change once: a heartbeat that re-attaches an
+            # expired lease returns a newer one, and every later call must
+            # carry it. A one-slot holder keeps the closures below in step.
+            lease = {"fence": int(work_item.get("lease_fence", 0))}
             # Echoed on complete so the engine records the result against it.
             idempotency_key: str | None = work_item.get("idempotency_key")
 
             console.print(f"[cyan]Claimed[/cyan] id={item_id} node=[bold]{node_id}[/bold] exec={exec_id}")
+            interval = _heartbeat_interval(work_item)
 
-            # Keep the lease alive while the handler runs.
+            ctx = WorkContext(item_id=item_id, execution_id=exec_id, node_id=node_id)
+            ctx_token = set_current_work(ctx)
+            handler_task: asyncio.Task[Any] | None = None
+
+            # Keep the lease alive while the handler runs, and stop the handler
+            # when the engine says the execution was cancelled.
             async def _heartbeat_loop() -> None:
                 while True:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(interval)
                     try:
-                        await client.heartbeat_work_item(item_id, worker_id, lease_fence)
+                        answer = await client.heartbeat_work_item(item_id, worker_id, lease["fence"])
                     except Exception as hb_err:
                         console.print(f"[yellow]Heartbeat error:[/yellow] {hb_err}")
+                        continue
+                    if not isinstance(answer, dict):
+                        continue
+                    new_fence = answer.get("lease_fence")
+                    if isinstance(new_fence, int) and new_fence != lease["fence"]:
+                        console.print(
+                            f"[yellow]Lease re-attached[/yellow] id={item_id} fence {lease['fence']} -> {new_fence}"
+                        )
+                        lease["fence"] = new_fence
+                    if answer.get("cancel_requested"):
+                        ctx.cancel_requested.set()
+                        if handler_task is not None:
+                            handler_task.cancel()
+                        return
 
             hb_task = asyncio.create_task(_heartbeat_loop())
 
@@ -1821,9 +1878,29 @@ async def _worker_loop(
 
                 _inject_seeds(exec_id)
 
-                result = fn(tool_input)
-                if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-                    result = await result
+                async def _run_handler() -> Any:
+                    # A coroutine function runs on the loop; anything else runs in
+                    # a thread so the heartbeat task keeps the lease alive. The
+                    # thread inherits this context, so `current_work()` works there.
+                    if asyncio.iscoroutinefunction(fn):
+                        return await fn(tool_input)
+                    outcome = await asyncio.to_thread(fn, tool_input)
+                    if asyncio.iscoroutine(outcome) or asyncio.isfuture(outcome):
+                        outcome = await outcome
+                    return outcome
+
+                handler_task = asyncio.create_task(_run_handler())
+                try:
+                    result = await handler_task
+                except asyncio.CancelledError:
+                    if not ctx.cancel_requested.is_set():
+                        raise
+                    console.print(
+                        f"[yellow]Abandoned[/yellow] id={item_id} node=[bold]{node_id}[/bold]: execution cancelled"
+                    )
+                    if once:
+                        return
+                    continue
 
                 duration_ms = int((time.monotonic() - t_start) * 1000)
                 output: Any = result if isinstance(result, dict) else {"result": result}
@@ -1862,10 +1939,10 @@ async def _worker_loop(
                         duration_ms,
                         gen_ai_model=gen_ai_model_field,
                         finish_reason=finish_reason_field,
-                        # Echo the lease fence from the claim so the runtime can fence
-                        # the completion (reject a stale/reclaimed lease). Omitted when
+                        # Echo the lease fence from the claim (or the re-attached one)
+                        # so the runtime can fence the completion. Omitted when
                         # 0/absent, keeping the unfenced fallback backward-compatible.
-                        lease_fence=lease_fence,
+                        lease_fence=lease["fence"],
                         idempotency_key=idempotency_key,
                     )
                 except Exception as complete_exc:
@@ -1891,7 +1968,7 @@ async def _worker_loop(
                     # proves the lease is still ours. It also buys the retry and
                     # dead-letter semantics — without it the runtime settles the
                     # item, emits no NodeFailed, and the execution never finishes.
-                    await client.fail_work_item(item_id, str(exc), lease_fence=lease_fence)
+                    await client.fail_work_item(item_id, str(exc), lease_fence=lease["fence"])
                 except Exception as fail_exc:
                     # 409: the lease was reclaimed while this node was failing, so
                     # a new claimant owns the item. Reporting our failure would
@@ -1903,6 +1980,7 @@ async def _worker_loop(
                         raise
             finally:
                 hb_task.cancel()
+                reset_current_work(ctx_token)
 
             if once:
                 return
@@ -1925,6 +2003,14 @@ def worker(
         None, "--modules", help="Comma-separated Python modules to import before polling"
     ),
     once: bool = typer.Option(False, "--once", help="Claim and process one item then exit"),  # noqa: FBT001
+    lease_secs: int | None = typer.Option(
+        None,
+        "--lease-secs",
+        min=5,
+        max=3600,
+        help="Lease to ask for on each claim, in seconds, 5 to 3600 (engine default 30); "
+        "heartbeats run at a third of the lease granted",
+    ),
 ) -> None:
     """Poll the runtime for python_tool work items and invoke @tool handlers.
 
@@ -1966,7 +2052,7 @@ def worker(
         async with JamjetClient(base_url=runtime) as client:
             if not once:
                 console.print("[dim]Polling for work items... (Ctrl+C to stop)[/dim]")
-            await _worker_loop(client, wid, queues, once=once)
+            await _worker_loop(client, wid, queues, once=once, lease_secs=lease_secs)
 
     try:
         asyncio.run(_start())

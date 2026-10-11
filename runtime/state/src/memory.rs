@@ -49,6 +49,11 @@ pub struct InMemoryBackend {
     projector_checkpoints: DashMap<(String, String), i64>,
     /// Content-addressed artifact store. Key = (tenant_id, hash).
     artifacts: DashMap<(String, String), (Vec<u8>, Option<String>)>,
+    /// Lease length a worker asked for at claim time, in seconds.
+    lease_secs: DashMap<WorkItemId, u64>,
+    /// Who held an expired lease and with which fence, so a late heartbeat
+    /// from that worker can re-attach instead of losing the work.
+    last_lease: DashMap<WorkItemId, (String, i64)>,
 }
 
 impl InMemoryBackend {
@@ -70,6 +75,8 @@ impl InMemoryBackend {
             proj_approvals: DashMap::new(),
             projector_checkpoints: DashMap::new(),
             artifacts: DashMap::new(),
+            lease_secs: DashMap::new(),
+            last_lease: DashMap::new(),
         }
     }
 
@@ -154,6 +161,38 @@ impl StateBackend for InMemoryBackend {
             }
             None => Err(StateBackendError::NotFound(id.to_string())),
         }
+    }
+
+    async fn finish_execution(
+        &self,
+        mut event: Event,
+        status: WorkflowStatus,
+    ) -> BackendResult<crate::backend::ExecutionFinish> {
+        use crate::backend::ExecutionFinish;
+        if !status.is_terminal() {
+            return Err(StateBackendError::Database(format!(
+                "finish_execution requires a terminal status, got {status:?}"
+            )));
+        }
+        // The execution's entry stays locked while the event is pushed, so a
+        // reader of the status cannot see it terminal without the event, or
+        // live with it.
+        let Some(mut entry) = self.executions.get_mut(&event.execution_id) else {
+            return Err(StateBackendError::NotFound(event.execution_id.to_string()));
+        };
+        if entry.status.is_terminal() {
+            return Ok(ExecutionFinish::AlreadyTerminal(entry.status.clone()));
+        }
+        entry.status = status;
+        entry.updated_at = Utc::now();
+        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        event.sequence = seq;
+        self.events
+            .entry(event.execution_id.clone())
+            .or_default()
+            .push(event);
+        drop(entry);
+        Ok(ExecutionFinish::Finished(seq))
     }
 
     async fn update_execution_current_state(
@@ -442,7 +481,67 @@ impl StateBackend for InMemoryBackend {
         worker_id: &str,
         queue_types: &[&str],
     ) -> BackendResult<Option<WorkItem>> {
+        self.claim_work_item_with_lease(worker_id, queue_types, None)
+            .await
+    }
+
+    async fn claim_work_item_with_lease(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+    ) -> BackendResult<Option<WorkItem>> {
+        // The fast reclaim of expired leases, mirroring the SQLite claim path:
+        // re-queue, remember the holder, charge the attempt, record the retry.
+        // An item of a terminal execution is settled instead, with nothing
+        // recorded (PR #140 review, I4).
+        let now = Utc::now();
+        let mut expired: Vec<WorkItem> = Vec::new();
+        let mut withdrawn: Vec<WorkItemId> = Vec::new();
+        for mut entry in self.work_items.iter_mut() {
+            let item = entry.value_mut();
+            let lapsed = item.lease_expires_at.is_some_and(|t| t < now);
+            if !lapsed || item.worker_id.is_none() {
+                continue;
+            }
+            let terminal = self
+                .executions
+                .get(&item.execution_id)
+                .is_some_and(|e| e.value().status.is_terminal());
+            if terminal {
+                withdrawn.push(item.id);
+            } else if item.attempt + 1 < item.max_attempts {
+                expired.push(item.clone());
+                self.last_lease.insert(
+                    item.id,
+                    (item.worker_id.clone().unwrap_or_default(), item.lease_fence),
+                );
+                let next = self
+                    .lease_epochs
+                    .get(&item.id)
+                    .map(|e| *e.value())
+                    .unwrap_or(0)
+                    + 1;
+                self.lease_epochs.insert(item.id, next);
+                item.worker_id = None;
+                item.lease_expires_at = None;
+                item.lease_fence = 0;
+                item.attempt += 1;
+            }
+        }
+        for id in withdrawn {
+            self.work_items.remove(&id);
+        }
+        for item in &expired {
+            for kind in crate::sqlite::lease_expiry_events(item) {
+                let seq = self.latest_sequence(&item.execution_id).await? + 1;
+                self.append_event(Event::new(item.execution_id.clone(), seq, kind))
+                    .await?;
+            }
+        }
+
         let term = self.store_term.load(Ordering::SeqCst);
+        let lease_len = crate::backend::granted_lease_secs(lease_secs);
         for mut entry in self.work_items.iter_mut() {
             let item = entry.value_mut();
             if item.worker_id.is_none() && queue_types.contains(&item.queue_type.as_str()) {
@@ -455,8 +554,11 @@ impl StateBackend for InMemoryBackend {
                 self.lease_epochs.insert(item.id, new_epoch);
                 let fence = term * 4_294_967_296_i64 + new_epoch;
                 item.worker_id = Some(worker_id.to_string());
-                item.lease_expires_at = Some(Utc::now() + chrono::Duration::seconds(30));
+                item.lease_expires_at =
+                    Some(Utc::now() + chrono::Duration::seconds(lease_len as i64));
                 item.lease_fence = fence;
+                self.lease_secs.insert(item.id, lease_len);
+                self.last_lease.remove(&item.id);
                 return Ok(Some(item.clone()));
             }
         }
@@ -479,11 +581,78 @@ impl StateBackend for InMemoryBackend {
                 if entry.lease_fence != lease_fence {
                     return Err(StateBackendError::FenceLost(item_id.to_string()));
                 }
-                entry.lease_expires_at = Some(Utc::now() + chrono::Duration::seconds(30));
+                let lease_len = self
+                    .lease_secs
+                    .get(&item_id)
+                    .map(|l| *l.value())
+                    .unwrap_or(crate::backend::DEFAULT_LEASE_SECS);
+                entry.lease_expires_at =
+                    Some(Utc::now() + chrono::Duration::seconds(lease_len as i64));
                 Ok(())
             }
             None => Err(StateBackendError::NotFound(item_id.to_string())),
         }
+    }
+
+    async fn heartbeat_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<crate::backend::LeaseRenewal> {
+        match self.renew_lease(item_id, worker_id, lease_fence).await {
+            Ok(()) => {
+                return Ok(crate::backend::LeaseRenewal {
+                    lease_fence,
+                    reattached: false,
+                })
+            }
+            Err(StateBackendError::FenceLost(_)) => {}
+            Err(e) => return Err(e),
+        }
+        // Re-attach only when the item is pending from an expiry, unclaimed,
+        // and the caller is the worker that held it with the fence it held.
+        let held = self.last_lease.get(&item_id).map(|h| h.value().clone());
+        let Some((last_worker, last_fence)) = held else {
+            return Err(StateBackendError::FenceLost(item_id.to_string()));
+        };
+        if last_worker != worker_id || last_fence != lease_fence {
+            return Err(StateBackendError::FenceLost(item_id.to_string()));
+        }
+        let Some(mut entry) = self.work_items.get_mut(&item_id) else {
+            return Err(StateBackendError::NotFound(item_id.to_string()));
+        };
+        // Nobody may have claimed, failed or parked the item since the expiry:
+        // the epoch must be exactly the one the expiry left (C1, PR #140 review).
+        let current_epoch = self
+            .lease_epochs
+            .get(&item_id)
+            .map(|e| *e.value())
+            .unwrap_or(0);
+        if entry.worker_id.is_some()
+            || current_epoch != crate::backend::epoch_after_expiry_of(lease_fence)
+        {
+            return Err(StateBackendError::FenceLost(item_id.to_string()));
+        }
+        let term = self.store_term.load(Ordering::SeqCst);
+        let new_epoch = current_epoch + 1;
+        self.lease_epochs.insert(item_id, new_epoch);
+        let fence = term * 4_294_967_296_i64 + new_epoch;
+        let lease_len = self
+            .lease_secs
+            .get(&item_id)
+            .map(|l| *l.value())
+            .unwrap_or(crate::backend::DEFAULT_LEASE_SECS);
+        entry.worker_id = Some(worker_id.to_string());
+        entry.lease_expires_at = Some(Utc::now() + chrono::Duration::seconds(lease_len as i64));
+        entry.lease_fence = fence;
+        entry.attempt = entry.attempt.saturating_sub(1);
+        drop(entry);
+        self.last_lease.remove(&item_id);
+        Ok(crate::backend::LeaseRenewal {
+            lease_fence: fence,
+            reattached: true,
+        })
     }
 
     async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>> {
@@ -652,28 +821,15 @@ impl StateBackend for InMemoryBackend {
     }
 
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()> {
-        match self.work_items.get_mut(&item_id) {
-            Some(mut entry) => {
-                entry.attempt += 1;
-                entry.worker_id = None;
-                entry.lease_expires_at = None;
-                // Bump epoch so any re-claim after a forced fail mints a
-                // strictly greater fence than the failed worker's stale token.
-                let next = self
-                    .lease_epochs
-                    .get(&item_id)
-                    .map(|e| *e.value())
-                    .unwrap_or(0)
-                    + 1;
-                self.lease_epochs.insert(item_id, next);
-                if let Some(obj) = entry.payload.as_object_mut() {
-                    obj.insert(
-                        "last_error".into(),
-                        serde_json::Value::String(error.to_string()),
-                    );
-                }
-                Ok(())
-            }
+        // Terminal, as on SQLite (`status = 'failed'`, which no claim or sweep
+        // selects): the item leaves the live queue. This used to bump the
+        // attempt and free the item, so it stayed claimable, and the claim
+        // route re-took the same dead item on every pass of its loop (PR #140
+        // review, finding I2). Memory settles by removal, like every other
+        // settle here.
+        let _ = error;
+        match self.work_items.remove(&item_id) {
+            Some(_) => Ok(()),
             None => Err(StateBackendError::NotFound(item_id.to_string())),
         }
     }
@@ -731,6 +887,47 @@ impl StateBackend for InMemoryBackend {
             delay_ms: (1u64 << new_attempt.min(6)) * 1000,
             item: Box::new(item),
         }))
+    }
+
+    async fn commit_turn_unless_terminal(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+        write_snapshot: bool,
+    ) -> BackendResult<crate::backend::TurnCommit> {
+        // Not atomic with the commit below: the in-memory backend is the
+        // dev/test path, and its `commit_turn` is not one atomic step either.
+        // The SQLite backends make the check part of the transaction.
+        let terminal = self
+            .executions
+            .get(&terminal_event.execution_id)
+            .map(|e| e.value().status.clone())
+            .filter(|status| status.is_terminal());
+        if let Some(status) = terminal {
+            if !self.withdraw_work_item_fenced(item_id, lease_fence).await? {
+                return Err(StateBackendError::FenceLost(item_id.to_string()));
+            }
+            return Ok(crate::backend::TurnCommit::ExecutionTerminal(status));
+        }
+        self.commit_turn(item_id, lease_fence, terminal_event, write_snapshot)
+            .await
+            .map(crate::backend::TurnCommit::Committed)
+    }
+
+    async fn withdraw_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        // Same guard as `complete_work_item_fenced`: held (claimed) under this
+        // fence, checked and removed in one step.
+        Ok(self
+            .work_items
+            .remove_if(&item_id, |_k, entry| {
+                entry.worker_id.is_some() && entry.lease_fence == lease_fence
+            })
+            .is_some())
     }
 
     async fn park_work_item(
@@ -805,6 +1002,10 @@ impl StateBackend for InMemoryBackend {
                 if expires < now && item.worker_id.is_some() {
                     item.attempt += 1;
                     if item.attempt < item.max_attempts {
+                        self.last_lease.insert(
+                            item.id,
+                            (item.worker_id.clone().unwrap_or_default(), item.lease_fence),
+                        );
                         item.worker_id = None;
                         item.lease_expires_at = None;
                         // Bump epoch so a re-claim mints a strictly greater fence.
@@ -956,5 +1157,74 @@ impl StateBackend for InMemoryBackend {
     async fn update_tenant(&self, tenant: Tenant) -> BackendResult<()> {
         self.tenants.insert(tenant.id.clone(), tenant);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::WorkItem;
+    use uuid::Uuid;
+
+    /// The epoch guard on re-attach, on its own. A claim also clears
+    /// `last_lease`, which hides the guard from every route-level test (PR
+    /// #140 re-review, M-A). Here the stale `last_lease` entry is put back by
+    /// hand, as if a later change dropped that clear: only the epoch check is
+    /// left to stop the zombie taking back an item another worker claimed and
+    /// released.
+    #[tokio::test]
+    async fn the_epoch_guard_alone_refuses_a_reattach_after_a_claim_and_release() {
+        let backend = InMemoryBackend::new();
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            execution_id: ExecutionId::new(),
+            node_id: "gpu_step".into(),
+            queue_type: "gpu".into(),
+            payload: serde_json::json!({}),
+            attempt: 0,
+            max_attempts: 5,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: crate::DEFAULT_TENANT.into(),
+        };
+        let id = backend.enqueue_work_item(item).await.unwrap();
+
+        let zombie = backend
+            .claim_work_item("w1", &["gpu"])
+            .await
+            .unwrap()
+            .expect("claimable");
+        backend.force_lease_expired_for_test(id);
+        // A poll of another queue runs the fast reclaim and claims nothing.
+        assert!(backend
+            .claim_work_item("w9", &["other"])
+            .await
+            .unwrap()
+            .is_none());
+
+        let second = backend
+            .claim_work_item("w2", &["gpu"])
+            .await
+            .unwrap()
+            .expect("re-queued item is claimable");
+        assert!(backend
+            .park_work_item(id, second.lease_fence, "1970-01-01T00:00:00Z", 1)
+            .await
+            .unwrap());
+        // The item is pending again, unclaimed, and the zombie's last lease
+        // is on record: everything re-attach checks except the epoch.
+        backend
+            .last_lease
+            .insert(id, ("w1".to_string(), zombie.lease_fence));
+
+        let outcome = backend.heartbeat_lease(id, "w1", zombie.lease_fence).await;
+        assert!(
+            matches!(outcome, Err(StateBackendError::FenceLost(_))),
+            "a zombie re-attached past a claim and release: {outcome:?}"
+        );
+        let item = backend.get_work_item(id).await.unwrap().expect("item");
+        assert!(item.worker_id.is_none(), "the zombie holds the item");
     }
 }

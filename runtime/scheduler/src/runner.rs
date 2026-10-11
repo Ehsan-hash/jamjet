@@ -418,146 +418,19 @@ impl Scheduler {
                 self.backend.append_event(sched_event).await?;
 
                 // Enqueue work item.
-                // Default max_attempts based on retry policy name (Phase 2: full policy resolution).
-                let max_attempts: u32 = match node.retry_policy.as_deref() {
-                    Some("no_retry") => 1,
-                    Some("io_default") => 5,
-                    Some("llm_default") => 3,
-                    _ => 3,
-                };
+                // Attempt budget from the node's named retry policy (Phase 2: full policy resolution).
+                let max_attempts = crate::payload::max_attempts_for(node.retry_policy.as_deref());
 
-                // Build the base payload that every work item carries.
-                let mut payload = serde_json::json!({
-                    "workflow_id": workflow_id,
-                    "workflow_version": workflow_version,
-                    "node_id": node_id,
-                });
-                // For PythonFn nodes, enrich the payload so the external Python
-                // worker is self-contained: it needs the module, the function to
-                // invoke, and the current workflow state as the call input.
-                // `progress.final_state` is the accumulated state (all
-                // `state_patch`es from completed nodes so far) and is available
-                // here without an additional backend call.
-                if let NodeKind::PythonFn {
-                    module, function, ..
-                } = &node.kind
-                {
-                    let obj = payload
-                        .as_object_mut()
-                        .expect("payload is always a JSON object");
-                    obj.insert("module".into(), serde_json::Value::String(module.clone()));
-                    obj.insert(
-                        "function".into(),
-                        serde_json::Value::String(function.clone()),
-                    );
-                    obj.insert(
-                        "input".into(),
-                        serde_json::Value::Object(progress.final_state.clone()),
-                    );
-                }
-
-                // For JavaFn nodes, enrich the payload so the external Java
-                // tool-worker is self-contained — exactly mirroring the PythonFn
-                // arm above, bar the language-appropriate dispatch coordinates:
-                // it needs the class to reflect, the method to invoke, and the
-                // current workflow state as the call input. The Java worker
-                // claims these `java_tool` items over the same HTTP claim/complete
-                // API the Python worker uses, so the contract is identical.
-                if let NodeKind::JavaFn {
-                    class_name, method, ..
-                } = &node.kind
-                {
-                    let obj = payload
-                        .as_object_mut()
-                        .expect("payload is always a JSON object");
-                    obj.insert(
-                        "class".into(),
-                        serde_json::Value::String(class_name.clone()),
-                    );
-                    obj.insert("method".into(), serde_json::Value::String(method.clone()));
-                    obj.insert(
-                        "input".into(),
-                        serde_json::Value::Object(progress.final_state.clone()),
-                    );
-                }
-
-                // For Model nodes, enrich the payload with model configuration and tool
-                // schemas so the model worker is self-contained.
-                if let NodeKind::Model {
-                    model_ref,
-                    system_prompt,
-                    tools,
-                    ..
-                } = &node.kind
-                {
-                    let obj = payload
-                        .as_object_mut()
-                        .expect("payload is always a JSON object");
-                    // Resolve model identifier from the IR's named models map.
-                    let model_id = ir
-                        .models
-                        .get(model_ref.as_str())
-                        .map(|cfg| {
-                            if cfg.provider.is_empty() {
-                                cfg.model.clone()
-                            } else {
-                                format!("{}/{}", cfg.provider, cfg.model)
-                            }
-                        })
-                        .unwrap_or_else(|| model_ref.clone());
-                    obj.insert("model".into(), serde_json::Value::String(model_id));
-                    // Optional model config overrides.
-                    if let Some(cfg) = ir.models.get(model_ref.as_str()) {
-                        if let Some(temp) = cfg.temperature {
-                            obj.insert("temperature".into(), serde_json::json!(temp));
-                        }
-                        if let Some(mt) = cfg.max_tokens {
-                            obj.insert("max_tokens".into(), serde_json::json!(mt));
-                        }
-                    }
-                    // Node-level system prompt.
-                    if let Some(sp) = system_prompt {
-                        obj.insert(
-                            "system_prompt".into(),
-                            serde_json::Value::String(sp.clone()),
-                        );
-                    }
-                    // Tool schemas — passed to the model so it can emit tool_calls.
-                    if !tools.is_empty() {
-                        obj.insert("tools".into(), serde_json::Value::Array(tools.clone()));
-                    }
-                    // Running conversation history — thread the accumulated
-                    // `messages` from state into the payload so each turn's model
-                    // call sees the full history (the agent loop accumulates them
-                    // in `state["messages"]`; the executor builds its ChatMessage
-                    // list from this when the node carries no inline `prompt`).
-                    // Without this the loop cannot feed tool results forward.
-                    if let Some(messages) = progress.final_state.get("messages") {
-                        obj.insert("messages".into(), messages.clone());
-                    }
-                }
-
-                // For Condition nodes, enrich the payload with the branch list
-                // and the current workflow state so the condition executor is
-                // self-contained.  The executor evaluates each branch's expression
-                // against `state` and records the routing decision on NodeCompleted.
-                // `progress.final_state` is the accumulated state from all
-                // completed nodes so far — exactly what the condition gate reads.
-                if let NodeKind::Condition { branches } = &node.kind {
-                    if !branches.is_empty() {
-                        let obj = payload
-                            .as_object_mut()
-                            .expect("payload is always a JSON object");
-                        obj.insert(
-                            "branches".into(),
-                            serde_json::to_value(branches).unwrap_or(serde_json::json!([])),
-                        );
-                        obj.insert(
-                            "state".into(),
-                            serde_json::Value::Object(progress.final_state.clone()),
-                        );
-                    }
-                }
+                // One builder for every node, shared with `POST /executions` so
+                // the start node carries the same enrichment as every later one.
+                let payload = crate::payload::build_work_item_payload(
+                    &ir,
+                    node_id,
+                    node,
+                    &progress.final_state,
+                    workflow_id,
+                    workflow_version,
+                );
 
                 let item = WorkItem {
                     id: Uuid::new_v4(),
@@ -612,18 +485,24 @@ impl Scheduler {
                 )
             };
 
-            let seq = self.backend.latest_sequence(execution_id).await? + 1;
-            self.backend
-                .append_event(jamjet_state::Event::new(
-                    execution_id.clone(),
-                    seq,
-                    event_kind,
-                ))
-                .await?;
-            info!(execution_id = %execution_id, ?status, "Execution reached terminal state");
-            self.backend
-                .update_execution_status(execution_id, status)
-                .await?;
+            // Event and status in one write (PR #140 re-review, I-A). A run
+            // cancelled since this tick read it keeps its cancel: nothing is
+            // appended after `WorkflowCancelled`.
+            match self
+                .backend
+                .finish_execution(
+                    jamjet_state::Event::new(execution_id.clone(), 0, event_kind),
+                    status.clone(),
+                )
+                .await?
+            {
+                jamjet_state::ExecutionFinish::Finished(_) => {
+                    info!(execution_id = %execution_id, ?status, "Execution reached terminal state");
+                }
+                jamjet_state::ExecutionFinish::AlreadyTerminal(prior) => {
+                    debug!(execution_id = %execution_id, ?prior, "Execution already terminal; nothing to record");
+                }
+            }
             // Execution is terminal; drop its progress so the cache doesn't grow
             // without bound as executions complete.
             self.progress.lock().unwrap().remove(execution_id);
@@ -767,7 +646,12 @@ impl ExecProgress {
                 // eventual ApprovalReceived decision and wedge the execution.
             }
             EventKind::RetryScheduled { node_id, .. } => {
-                self.scheduled.insert(node_id.clone());
+                // Same guard as `NodeScheduled`: a retry recorded after the node
+                // reached a terminal outcome (a lease reclaim racing the
+                // completion of the item it re-queued) must not resurrect it.
+                if !self.completed.contains(node_id) && !self.terminal_failed.contains(node_id) {
+                    self.scheduled.insert(node_id.clone());
+                }
             }
             EventKind::NodeParked { .. } => {
                 // NodeParked is an audit/observability event. The node is
@@ -1156,6 +1040,64 @@ mod tests {
              — the execution would never reach a terminal state, on this fold and \
              on every replay of the same log"
         );
+    }
+
+    /// The same guard on `RetryScheduled` (PR #140 review, finding I4).
+    ///
+    /// The claim path's fast reclaim writes `NodeFailed` + `RetryScheduled` for
+    /// a lost lease. If another worker claims and completes the item first,
+    /// the log reads `NodeCompleted` and then the retry. Re-inserting the node
+    /// into `scheduled` there wedges the run exactly as a late `NodeStarted`
+    /// would.
+    #[test]
+    fn a_late_retry_scheduled_does_not_resurrect_a_completed_node() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+            node_completed("a", serde_json::json!({})),
+            EventKind::NodeFailed {
+                node_id: "a".into(),
+                error: "lease expired: worker presumed dead".into(),
+                attempt: 0,
+                retryable: true,
+            },
+            EventKind::RetryScheduled {
+                node_id: "a".into(),
+                attempt: 1,
+                delay_ms: 0,
+            },
+        ]);
+        assert!(progress.completed.contains("a"));
+        assert!(
+            !progress.scheduled.contains("a"),
+            "a late RetryScheduled must not put a COMPLETED node back in `scheduled`"
+        );
+    }
+
+    /// And for a terminally-failed node.
+    #[test]
+    fn a_late_retry_scheduled_does_not_resurrect_a_terminally_failed_node() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+            EventKind::NodeFailed {
+                node_id: "a".into(),
+                error: "dead".into(),
+                attempt: 3,
+                retryable: false,
+            },
+            EventKind::RetryScheduled {
+                node_id: "a".into(),
+                attempt: 3,
+                delay_ms: 0,
+            },
+        ]);
+        assert!(progress.terminal_failed.contains("a"));
+        assert!(!progress.scheduled.contains("a"));
     }
 
     /// The same guard for a terminally-failed node.

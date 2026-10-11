@@ -42,6 +42,44 @@
 
 use serde_json::Value;
 
+/// Check that a branch expression is one this evaluator can ever satisfy.
+///
+/// `eval_condition` is total and fail-closed: an expression it does not
+/// understand evaluates to `false` with a WARN in the engine log. That is the
+/// right runtime behaviour and the wrong registration behaviour, because a
+/// workflow whose branch reads `attempt == 1` instead of `state.attempt == 1`
+/// registers fine and then never takes the branch. Run this at registration
+/// so the author hears about it once, with the rule spelled out.
+pub fn validate_expression(expr: &str) -> Result<(), String> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return Err("expression is empty".into());
+    }
+    match find_first_op(expr) {
+        Some((op_pos, _op)) => {
+            let lhs = expr[..op_pos].trim();
+            let rhs = expr[op_pos + 2..].trim();
+            require_state_path(lhs)?;
+            if parse_literal(rhs).is_none() {
+                return Err(format!(
+                    "right-hand side `{rhs}` is not a literal (use a double-quoted string, a number, true, false or null)"
+                ));
+            }
+            Ok(())
+        }
+        None => require_state_path(expr),
+    }
+}
+
+fn require_state_path(lhs: &str) -> Result<(), String> {
+    match lhs.strip_prefix("state.") {
+        Some(p) if !p.is_empty() && p.split('.').all(|seg| !seg.is_empty()) => Ok(()),
+        _ => Err(format!(
+            "left-hand side `{lhs}` must be a `state.<path>` reference"
+        )),
+    }
+}
+
 /// Evaluate a Condition-node branch expression against committed workflow state.
 ///
 /// Pure + total: never panics; a malformed or unsupported expression returns `false`.

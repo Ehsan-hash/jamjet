@@ -188,6 +188,15 @@ async fn create_workflow(
     // version skew loud at the one moment the operator can act on it.
     jamjet_ir::validate_agent_tool_dispatch(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // A branch expression the evaluator cannot satisfy would register fine and
+    // then evaluate false forever, with only a WARN in the engine log to say so.
+    jamjet_ir::validate_condition_expressions(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // An `external_fn` queue named after a built-in queue (or empty, or with
+    // characters a worker cannot send) would route its items to a worker that
+    // cannot run them, or to none at all.
+    jamjet_ir::validate_external_queues(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
     let def = WorkflowDefinition {
@@ -270,18 +279,36 @@ async fn start_execution(
     );
     backend.append_event(event).await?;
 
-    // Immediately enqueue the start node as a work item, routed to the queue its
-    // kind requires (e.g. a Model start node -> the "model" queue), mirroring the
-    // scheduler's logic for chained nodes.
-    let queue_type = def
-        .ir
-        .get("nodes")
-        .and_then(|nodes| nodes.get(&start_node))
-        .and_then(|node| node.get("kind"))
-        .and_then(|kind| serde_json::from_value::<jamjet_core::node::NodeKind>(kind.clone()).ok())
-        .and_then(|k| serde_json::to_value(k.queue_type()).ok())
+    // Immediately enqueue the start node as a work item, built by the same
+    // payload builder the scheduler uses for every later node. Until 2026-09-06
+    // this carried only the two workflow fields, so a `python_fn` start node
+    // had no `module`/`function`/`input` and failed three times.
+    let ir: jamjet_ir::WorkflowIr = serde_json::from_value(def.ir.clone()).map_err(|e| {
+        ApiError::Internal(format!(
+            "stored IR for workflow {} v{} is not loadable: {e}",
+            body.workflow_id, version
+        ))
+    })?;
+    let start_def = ir.nodes.get(&start_node).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "workflow {} v{} names start node '{}' which does not exist",
+            body.workflow_id, version, start_node
+        ))
+    })?;
+    let queue_type = serde_json::to_value(start_def.kind.queue_type())
+        .ok()
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "general".to_string());
+    let initial_state = input.as_object().cloned().unwrap_or_default();
+    let payload = jamjet_scheduler::build_work_item_payload(
+        &ir,
+        &start_node,
+        start_def,
+        &initial_state,
+        &body.workflow_id,
+        &version,
+    );
+    let max_attempts = jamjet_scheduler::max_attempts_for(start_def.retry_policy.as_deref());
     let sched_event = jamjet_state::Event::new(
         execution_id.clone(),
         2,
@@ -297,12 +324,9 @@ async fn start_execution(
         execution_id: execution_id.clone(),
         node_id: start_node,
         queue_type,
-        payload: json!({
-            "workflow_id": body.workflow_id,
-            "workflow_version": version,
-        }),
+        payload,
         attempt: 0,
-        max_attempts: 3,
+        max_attempts,
         created_at: now,
         lease_expires_at: None,
         worker_id: None,
@@ -383,18 +407,29 @@ async fn cancel_execution(
         )));
     }
 
-    let seq = backend.latest_sequence(&execution_id).await? + 1;
+    // One write for the event and the status: a fenced `/complete` checks
+    // the status inside its own transaction, and must never find the run
+    // live after `WorkflowCancelled` is in the log (PR #140 re-review, I-A).
+    // The sequence is assigned by the backend.
     let event = jamjet_state::Event::new(
         execution_id.clone(),
-        seq,
+        0,
         jamjet_state::EventKind::WorkflowCancelled {
             reason: Some("user request".into()),
         },
     );
-    backend.append_event(event).await?;
-    backend
-        .update_execution_status(&execution_id, WorkflowStatus::Cancelled)
-        .await?;
+    match backend
+        .finish_execution(event, WorkflowStatus::Cancelled)
+        .await?
+    {
+        jamjet_state::ExecutionFinish::Finished(_) => {}
+        // Another termination won the race since the read above.
+        jamjet_state::ExecutionFinish::AlreadyTerminal(status) => {
+            return Err(ApiError::BadRequest(format!(
+                "execution {id} is already in terminal state: {status:?}"
+            )));
+        }
+    }
 
     Ok(Json(json!({ "execution_id": id, "status": "cancelled" })))
 }
@@ -1023,6 +1058,11 @@ async fn update_tenant(
 struct ClaimWorkItemRequest {
     worker_id: String,
     queue_types: Vec<String>,
+    /// How long a lease the worker needs, in seconds. Renewals keep it. The
+    /// backend default (30 s) applies when absent; a worker that runs long
+    /// steps asks for what it can heartbeat comfortably.
+    #[serde(default)]
+    lease_secs: Option<u64>,
 }
 
 /// The claim response for "you get nothing".
@@ -1051,10 +1091,49 @@ async fn claim_work_item(
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
     let queue_refs: Vec<&str> = body.queue_types.iter().map(|s| s.as_str()).collect();
-    let item = backend
-        .claim_work_item(&body.worker_id, &queue_refs)
-        .await?;
-    let Some(wi) = item else {
+    // The lease this claim is granted: what the worker asked for, held to the
+    // engine's bounds, or the default. The backend applies the same rule; the
+    // answer echoes it so the worker paces its heartbeats from the lease it
+    // actually holds, not the one it asked for.
+    let granted_lease_secs = jamjet_state::granted_lease_secs(body.lease_secs);
+    let lease_secs = Some(granted_lease_secs);
+    // A cancelled, completed or failed execution can still own pending items:
+    // one re-queued by an expired lease, or the start node of a run cancelled
+    // before any worker polled. Handing those out burns worker time on a run
+    // nobody wants (spike finding G10, 2026-09-06). Settle them as failed with
+    // the reason and keep claiming, bounded so a queue of dead items cannot pin
+    // the request.
+    let mut claimed = None;
+    for _ in 0..16 {
+        let Some(candidate) = backend
+            .claim_work_item_with_lease(&body.worker_id, &queue_refs, lease_secs)
+            .await?
+        else {
+            break;
+        };
+        let terminal_status = match backend.get_execution(&candidate.execution_id).await? {
+            Some(exec) if exec.status.is_terminal() => Some(exec.status),
+            _ => None,
+        };
+        match terminal_status {
+            Some(status) => {
+                warn!(
+                    work_item_id = %candidate.id,
+                    execution_id = %candidate.execution_id,
+                    ?status,
+                    "claim: withholding work of a terminal execution"
+                );
+                backend
+                    .fail_work_item(candidate.id, &format!("execution is {status:?}"))
+                    .await?;
+            }
+            None => {
+                claimed = Some(candidate);
+                break;
+            }
+        }
+    }
+    let Some(wi) = claimed else {
         return Ok(nothing_to_claim());
     };
 
@@ -1096,6 +1175,9 @@ async fn claim_work_item(
             // The lease fence the external worker echoes on complete so the
             // engine can prove the lease is still held (exactly-once-COMMIT).
             "lease_fence": wi.lease_fence,
+            // The lease length granted, which may differ from the one asked
+            // for, so the worker can pace its heartbeats.
+            "lease_secs": granted_lease_secs,
             // Echoed on complete so the result is recorded against it and a
             // re-run replays instead of re-firing the tool.
             "idempotency_key": idem_key,
@@ -1614,11 +1696,20 @@ async fn complete_work_item(
     //
     // No item, no event: without trustworthy coordinates the only honest options
     // are settle-quietly or write into a run we cannot vouch for.
+    //
+    // A result that arrives after the run reached a terminal state (a cancel
+    // while the step was running, spike finding G10b) must not be recorded:
+    // no event, no state patch. `commit_turn_unless_terminal` reads the run's
+    // status INSIDE the commit's transaction, so a cancel cannot land between
+    // a check here and the write there (PR #140 review, I3), and it checks the
+    // fence before it touches anything, so neither a retried completion of a
+    // settled item nor a forged fence can settle an item (I1). The holder's
+    // own item is withdrawn so an expiring lease cannot resurrect it.
     let committed_atomically = match (body.lease_fence, recorded.as_ref()) {
         (Some(fence), Some(wi)) => {
             let execution_id = wi.execution_id.clone();
             match backend
-                .commit_turn(
+                .commit_turn_unless_terminal(
                     item_id,
                     fence,
                     node_completed(&execution_id, &wi.node_id),
@@ -1626,7 +1717,15 @@ async fn complete_work_item(
                 )
                 .await
             {
-                Ok(_) => true,
+                Ok(jamjet_state::TurnCommit::Committed(_)) => true,
+                Ok(jamjet_state::TurnCommit::ExecutionTerminal(status)) => {
+                    let reason = format!("execution is {status:?}");
+                    warn!(work_item_id = %id, execution_id = %execution_id, "complete: refused, {reason}");
+                    return Ok((
+                        StatusCode::CONFLICT,
+                        Json(json!({ "completed": false, "reason": reason })),
+                    ));
+                }
                 Err(jamjet_state::StateBackendError::FenceLost(_)) => {
                     return Ok((
                         StatusCode::CONFLICT,
@@ -1659,6 +1758,21 @@ async fn complete_work_item(
         // fence-guarded by construction, and without a fence we cannot show the
         // item is ours to settle.
         (None, _) => {
+            // Without a fence nothing shows the item is the caller's, so a
+            // terminal run's item is refused and left alone; its lease lapses
+            // and the claim path settles it.
+            if let Some(wi) = recorded.as_ref() {
+                if let Some(exec) = backend.get_execution(&wi.execution_id).await? {
+                    if exec.status.is_terminal() {
+                        let reason = format!("execution is {:?}", exec.status);
+                        warn!(work_item_id = %id, execution_id = %wi.execution_id, "complete: refused, {reason}");
+                        return Ok((
+                            StatusCode::CONFLICT,
+                            Json(json!({ "completed": false, "reason": reason })),
+                        ));
+                    }
+                }
+            }
             warn!(
                 work_item_id = %id,
                 "complete: unfenced legacy path — settle and terminal event are \
@@ -1803,6 +1917,25 @@ async fn fail_work_item(
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
+    // Same rule as `complete`: nothing is recorded against a terminal run.
+    // Only the holder's own item is withdrawn, fenced: a forged fence, or a
+    // report for an item that already settled, leaves it exactly as it is
+    // (PR #140 review, I1).
+    if let Ok(Some(wi)) = backend.get_work_item(item_id).await {
+        if let Some(exec) = backend.get_execution(&wi.execution_id).await? {
+            if exec.status.is_terminal() {
+                let reason = format!("execution is {:?}", exec.status);
+                warn!(work_item_id = %id, execution_id = %wi.execution_id, "fail: refused, {reason}");
+                if let Some(fence) = body.lease_fence.filter(|f| *f > 0) {
+                    backend.withdraw_work_item_fenced(item_id, fence).await?;
+                }
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({ "failed": false, "work_item_id": id, "reason": reason })),
+                ));
+            }
+        }
+    }
 
     let Some(fence) = body.lease_fence else {
         // Legacy unfenced path, deprecated. Preserved verbatim so existing
@@ -1922,10 +2055,40 @@ async fn heartbeat_work_item(
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
-    backend
-        .renew_lease(item_id, &body.worker_id, body.lease_fence)
-        .await?;
-    Ok(Json(json!({ "renewed": true, "work_item_id": id })))
+    // Renew, or re-attach after an expiry nobody else claimed (an engine
+    // restart longer than the lease). A lease that is truly lost is a 409 the
+    // worker can act on, not a 500.
+    let renewal = match backend
+        .heartbeat_lease(item_id, &body.worker_id, body.lease_fence)
+        .await
+    {
+        Ok(renewal) => renewal,
+        Err(jamjet_state::StateBackendError::FenceLost(_)) => {
+            return Err(ApiError::Conflict(format!(
+                "lease on work item {id} is no longer held by {}",
+                body.worker_id
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    // The heartbeat is the one channel every external worker already polls,
+    // so it carries the cancel signal (spike finding G10, 2026-09-06). The
+    // worker abandons the step; the claim route settles the item once its
+    // lease lapses.
+    let cancel_requested = match backend.get_work_item(item_id).await? {
+        Some(wi) => backend
+            .get_execution(&wi.execution_id)
+            .await?
+            .is_some_and(|exec| exec.status.is_terminal()),
+        None => false,
+    };
+    Ok(Json(json!({
+        "renewed": true,
+        "work_item_id": id,
+        "lease_fence": renewal.lease_fence,
+        "reattached": renewal.reattached,
+        "cancel_requested": cancel_requested,
+    })))
 }
 
 // ── Coordinator decisions ────────────────────────────────────────────────────

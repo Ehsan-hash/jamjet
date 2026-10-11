@@ -1894,12 +1894,10 @@ mod tests {
         let f1 = item_a.lease_fence;
         assert!(f1 > 0, "fence must be non-zero after claim");
 
-        // Steal the lease: fail_work_item resets worker_id + bumps the epoch,
-        // making the item re-claimable.
-        backend
-            .fail_work_item(item_a.id, "lease stolen for test")
-            .await
-            .unwrap();
+        // Steal the lease: it lapses, and the next claim poll re-queues the
+        // item with a bumped epoch. (This used `fail_work_item`, which on
+        // memory only freed the item; it now settles it, as on SQLite.)
+        backend.force_lease_expired_for_test(item_a.id);
 
         // Worker B claims and gets fence F2 > F1.
         let item_b = backend
@@ -3988,10 +3986,7 @@ mod tests {
             .await
             .unwrap()
             .expect("claimable");
-        backend
-            .fail_work_item(item_a.id, "lease stolen for test")
-            .await
-            .unwrap();
+        backend.force_lease_expired_for_test(item_a.id);
 
         // Worker B takes it with a strictly greater fence.
         let item_b = backend

@@ -1192,6 +1192,14 @@ impl StateBackend for FailFirstGetEvents {
         self.inner.get_execution(id).await
     }
 
+    async fn finish_execution(
+        &self,
+        event: jamjet_state::Event,
+        status: WorkflowStatus,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::ExecutionFinish> {
+        self.inner.finish_execution(event, status).await
+    }
+
     async fn update_execution_status(
         &self,
         id: &ExecutionId,
@@ -1353,6 +1361,50 @@ impl StateBackend for FailFirstGetEvents {
         queue_types: &[&str],
     ) -> jamjet_state::backend::BackendResult<Option<WorkItem>> {
         self.inner.claim_work_item(worker_id, queue_types).await
+    }
+
+    async fn claim_work_item_with_lease(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::WorkItem>> {
+        self.inner
+            .claim_work_item_with_lease(worker_id, queue_types, lease_secs)
+            .await
+    }
+
+    async fn heartbeat_lease(
+        &self,
+        item_id: jamjet_state::backend::WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::LeaseRenewal> {
+        self.inner
+            .heartbeat_lease(item_id, worker_id, lease_fence)
+            .await
+    }
+
+    async fn commit_turn_unless_terminal(
+        &self,
+        item_id: jamjet_state::backend::WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+        write_snapshot: bool,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::TurnCommit> {
+        self.inner
+            .commit_turn_unless_terminal(item_id, lease_fence, terminal_event, write_snapshot)
+            .await
+    }
+
+    async fn withdraw_work_item_fenced(
+        &self,
+        item_id: jamjet_state::backend::WorkItemId,
+        lease_fence: i64,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner
+            .withdraw_work_item_fenced(item_id, lease_fence)
+            .await
     }
 
     async fn renew_lease(

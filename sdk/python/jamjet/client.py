@@ -261,16 +261,19 @@ class JamjetClient:
         self,
         worker_id: str,
         queue_types: list[str],
+        lease_secs: int | None = None,
     ) -> dict[str, Any] | None:
         """Claim the next available work item.
 
-        Returns the work_item dict on success, or ``None`` when the queue is
-        empty (runtime responds with ``{"claimed": false}``).
+        ``lease_secs`` asks the engine for a lease of that length (its default
+        is 30 s); renewals keep it. Returns the work_item dict on success, or
+        ``None`` when the queue is empty (runtime responds with
+        ``{"claimed": false}``).
         """
-        r = await self._client.post(
-            "/work-items/claim",
-            json={"worker_id": worker_id, "queue_types": queue_types},
-        )
+        body: dict[str, Any] = {"worker_id": worker_id, "queue_types": queue_types}
+        if lease_secs is not None:
+            body["lease_secs"] = int(lease_secs)
+        r = await self._client.post("/work-items/claim", json=body)
         r.raise_for_status()
         data = r.json()
         if not data.get("claimed"):
@@ -354,17 +357,25 @@ class JamjetClient:
         item_id: str,
         worker_id: str,
         lease_fence: int = 0,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Renew the lease on a claimed work item.
 
         ``lease_fence`` must match the value returned when the item was
         claimed; a stale fence causes the runtime to reject the renewal.
+
+        The answer carries ``cancel_requested`` once the execution has been
+        cancelled; the worker loop acts on it.
         """
         r = await self._client.post(
             f"/work-items/{item_id}/heartbeat",
             json={"worker_id": worker_id, "lease_fence": lease_fence},
         )
         r.raise_for_status()
+        try:
+            body = r.json()
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
 
     # ── Generic helpers (for one-off API paths not covered above) ─────────
 

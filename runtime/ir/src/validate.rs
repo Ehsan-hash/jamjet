@@ -26,6 +26,8 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_reachability(ir)?;
     validate_refs(ir)?;
     validate_agent_tool_dispatch(ir)?;
+    validate_condition_expressions(ir)?;
+    validate_external_queues(ir)?;
     Ok(())
 }
 
@@ -76,6 +78,71 @@ pub fn validate_agent_tool_dispatch(ir: &WorkflowIr) -> IrResult<()> {
             if is_adk_dispatch_coordinates(module, function) && !agent_tool_dispatch {
                 return Err(IrError::UnmarkedAgentToolDispatch(id.clone()));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Every condition branch expression must be one the runtime's evaluator can
+/// satisfy: a `state.<path>` reference, optionally compared with `==` or `!=`
+/// to a JSON literal. Anything else evaluates false forever at runtime, so it
+/// is refused here, at the one moment the author is listening.
+pub fn validate_condition_expressions(ir: &WorkflowIr) -> IrResult<()> {
+    use jamjet_core::node::NodeKind;
+    for (id, node) in &ir.nodes {
+        if let NodeKind::Condition { branches } = &node.kind {
+            for branch in branches {
+                if let Some(expr) = &branch.condition {
+                    if let Err(reason) = jamjet_core::validate_expression(expr) {
+                        return Err(IrError::InvalidConditionExpression {
+                            node: id.clone(),
+                            expr: expr.clone(),
+                            reason,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The longest queue name an `external_fn` node may use.
+pub const MAX_QUEUE_NAME_LEN: usize = 64;
+
+/// Every `external_fn` node must name a queue an external worker can own:
+/// non-empty, at most [`MAX_QUEUE_NAME_LEN`] ASCII letters, digits, `-`, `_`
+/// or `.`, and not one of the built-in queues. A built-in name would route the
+/// item to a worker that cannot run it (a `python_tool` worker gets a payload
+/// with no module or function and fails it until it is dead-lettered).
+pub fn validate_external_queues(ir: &WorkflowIr) -> IrResult<()> {
+    use jamjet_core::node::{NodeKind, QueueType};
+    for (id, node) in &ir.nodes {
+        let NodeKind::ExternalFn { queue, .. } = &node.kind else {
+            continue;
+        };
+        let reason = if queue.is_empty() {
+            Some("the queue name is empty".to_string())
+        } else if queue.len() > MAX_QUEUE_NAME_LEN {
+            Some(format!(
+                "the queue name is longer than {MAX_QUEUE_NAME_LEN} characters"
+            ))
+        } else if !queue
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            Some("use only ASCII letters, digits, '-', '_' and '.'".to_string())
+        } else if !matches!(QueueType::from_name(queue), QueueType::Named(_)) {
+            Some("that is a built-in queue; name a queue of your own".to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(IrError::InvalidQueueName {
+                node: id.clone(),
+                queue: queue.clone(),
+                reason,
+            });
         }
     }
     Ok(())
