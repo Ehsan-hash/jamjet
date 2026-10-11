@@ -7,7 +7,7 @@
     <parent>
         <groupId>dev.jamjet</groupId>
         <artifactId>jamjet-parent</artifactId>
-        <version>0.5.0</version>
+        <version>0.5.1</version>
     </parent>
 
     <artifactId>jamjet-cli</artifactId>
@@ -28,6 +28,12 @@
             <version>${picocli.version}</version>
         </dependency>
 
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <!-- SLF4J simple for CLI logging -->
         <dependency>
             <groupId>org.slf4j</groupId>
@@ -37,6 +43,13 @@
     </dependencies>
 
     <build>
+        <resources>
+            <!-- Filtered so the *-version.properties files carry ${project.version}. -->
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
