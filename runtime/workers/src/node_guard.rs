@@ -149,6 +149,9 @@ struct CardGate {
     /// Names of an agent tool dispatch's calls that are gated: raised through
     /// the dispatch guard's per-call request, alongside any chain gates.
     calls: Vec<String>,
+    /// Every agent the node acts for, with its card's constraints. Empty
+    /// when it acts for none.
+    agents: crate::agent_limits::Agents,
 }
 
 /// Decide whether `node_def` may fire (or, in `Complete` mode, whether its
@@ -186,10 +189,13 @@ pub async fn guard_item(
     payload: &Value,
     sealer: Option<&dyn ApprovalSealer>,
     agents: AgentScope<'_>,
+    work_item_id: Option<uuid::Uuid>,
 ) -> GuardOutcome {
+    use crate::agent_limits;
+
     // First, so a node the agent may not use never raises an approval request
     // and is refused even when no policy applies.
-    let card = match agent_card(
+    let mut card = match agent_card(
         backend,
         mode,
         execution_id,
@@ -203,6 +209,123 @@ pub async fn guard_item(
         Ok(gate) => gate,
         Err(refused) => return refused,
     };
+
+    // Then the agents' autonomy limits (see `agent_limits`). A firing check
+    // decides from the run's log and, if the node may fire, records the step
+    // below; a completion only has to belong to an admitted step.
+    let mut agents_of_node = std::mem::take(&mut card.agents);
+    match callee(agents.registry, &node_def.kind).await {
+        Ok(Some(c)) if !agents_of_node.iter().any(|(a, _)| *a == c.0) => agents_of_node.push(c),
+        Ok(_) => {}
+        Err(unavailable) => return unavailable,
+    }
+    let plan = if agents_of_node.is_empty() {
+        None
+    } else {
+        match mode {
+            GuardMode::Fire => match agent_limits::plan(
+                backend,
+                execution_id,
+                node_id,
+                agents_of_node,
+                match step_tool_calls(node_def, payload) {
+                    Ok(calls) => calls,
+                    Err(rule) => return GuardOutcome::Blocked { reason: rule },
+                },
+            )
+            .await
+            {
+                Ok(plan) => Some(plan),
+                Err(refused) => return refused,
+            },
+            GuardMode::Complete => {
+                if let Err(refused) =
+                    agent_limits::completion_admitted(backend, execution_id, work_item_id).await
+                {
+                    return refused;
+                }
+                None
+            }
+        }
+    };
+    let escalation = plan.as_ref().and_then(|p| p.escalation.clone());
+    // Where the log stood before deciding: an escalation's stop is recorded
+    // only when this decision raised a new request for it.
+    let before = match &escalation {
+        Some(_) => match backend.latest_sequence(execution_id).await {
+            Ok(seq) => Some(seq),
+            Err(e) => {
+                return GuardOutcome::Unavailable {
+                    reason: format!("run log unreadable: {e}"),
+                }
+            }
+        },
+        None => None,
+    };
+
+    let outcome = guard_policy(
+        backend,
+        mode,
+        execution_id,
+        node_id,
+        tenant_id,
+        workflow_policy,
+        node_def,
+        payload,
+        sealer,
+        card,
+        escalation.as_ref(),
+    )
+    .await;
+
+    if let (Some(e), Some(before)) = (&escalation, before) {
+        if matches!(outcome, GuardOutcome::Held { .. }) {
+            let raised = backend
+                .get_events_since(execution_id, before)
+                .await
+                .map(|evs| {
+                    evs.iter().any(|ev| {
+                        matches!(&ev.kind, EventKind::ToolApprovalRequired { node_id: n, .. } if n == node_id)
+                    })
+                })
+                .unwrap_or(true);
+            if raised {
+                agent_limits::record_stop(
+                    backend,
+                    execution_id,
+                    node_id,
+                    &e.agent,
+                    &e.decision,
+                    Some("human_approval"),
+                )
+                .await;
+            }
+        }
+    }
+    match (outcome, plan) {
+        (GuardOutcome::Allow, Some(plan)) => {
+            agent_limits::admit(backend, execution_id, node_id, work_item_id, plan).await
+        }
+        (outcome, _) => outcome,
+    }
+}
+
+/// [`guard_item`] after the agent card: the policy chain, the card's gates,
+/// an autonomy escalation, and the approvals that answer them.
+#[allow(clippy::too_many_arguments)]
+async fn guard_policy(
+    backend: &dyn StateBackend,
+    mode: GuardMode,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tenant_id: &str,
+    workflow_policy: Option<&PolicySetIr>,
+    node_def: &NodeDef,
+    payload: &Value,
+    sealer: Option<&dyn ApprovalSealer>,
+    card: CardGate,
+    escalation: Option<&crate::agent_limits::Escalation>,
+) -> GuardOutcome {
     let card_calls = card.calls.clone();
     let card_gate = card.node;
     let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
@@ -279,13 +402,16 @@ pub async fn guard_item(
     } else {
         PolicyEvaluator.evaluate(&ctx, &sets)
     };
-    // A card gate turns an allow into an approval; a block stays a block, and
-    // a chain gate is already one.
-    let decision = match (decision, &card_gate) {
-        (PolicyDecision::Allow, Some(_)) => PolicyDecision::RequireApproval {
-            approver: "human".to_string(),
-        },
-        (d, _) => d,
+    // A card gate or an autonomy escalation turns an allow into an approval;
+    // a block stays a block, and a chain gate is already one (whose approval
+    // also covers the escalation: both approve this one action).
+    let decision = match decision {
+        PolicyDecision::Allow if card_gate.is_some() || escalation.is_some() => {
+            PolicyDecision::RequireApproval {
+                approver: "human".to_string(),
+            }
+        }
+        d => d,
     };
     match decision {
         PolicyDecision::Allow if is_dispatch => per_call(false).await,
@@ -339,10 +465,17 @@ pub async fn guard_item(
                         payload,
                         tool_name,
                         approver,
-                        serde_json::json!({ "node_id": node_id }),
+                        {
+                            let mut c = serde_json::json!({ "node_id": node_id });
+                            if let Some(e) = escalation {
+                                c[crate::agent_limits::ESCALATION_KEY] = e.context();
+                            }
+                            c
+                        },
                         deadline,
                         tenant_id,
                         sealer,
+                        escalation.is_some(),
                     )
                     .await
                 }
@@ -357,6 +490,61 @@ pub async fn guard_item(
             }
         }
     }
+}
+
+/// The agent an `agent` node calls, with its card's constraints: that
+/// agent takes a step when the node runs, so its autonomy limits apply (its
+/// tool and delegation lists do not: they restrict what the agent itself
+/// uses, and the node is not acting for it). `Ok(None)`: not an `agent` node,
+/// no registry, or the callee has no registered card. An unreadable registry
+/// refuses.
+async fn callee(
+    registry: Option<&dyn AgentRegistry>,
+    kind: &NodeKind,
+) -> Result<Option<(String, Option<jamjet_agents::card::AutonomyConstraints>)>, GuardOutcome> {
+    let (NodeKind::Agent { agent_ref, .. }, Some(registry)) = (kind, registry) else {
+        return Ok(None);
+    };
+    match registry.get_by_uri(agent_ref).await {
+        Ok(Some(agent)) => Ok(Some((agent_ref.clone(), agent.card.constraints))),
+        Ok(None) => Ok(None),
+        Err(e) => Err(GuardOutcome::Unavailable {
+            reason: format!(
+                "agent registry unavailable; refusing to run without checking the autonomy \
+                 limits of agent '{agent_ref}': {e}"
+            ),
+        }),
+    }
+}
+
+/// The tool calls a node makes if it fires, for `max_tool_calls`: one for a
+/// node that uses a tool (or picks its target at run time), plus each call
+/// of an agent tool dispatch batch. The ADK dispatcher itself is not a tool
+/// use, only its calls are. An unreadable batch is an error (its audit rule),
+/// never zero calls: the limit must not depend on a later guard refusing it.
+fn step_tool_calls(node_def: &NodeDef, payload: &Value) -> Result<u32, String> {
+    let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
+    let calls_only = match &node_def.kind {
+        NodeKind::PythonFn {
+            module, function, ..
+        } => is_dispatch && jamjet_ir::is_adk_dispatch_coordinates(module, function),
+        _ => false,
+    };
+    let ctx = EvaluationContext::from_node_kind(&node_def.id, &node_def.kind);
+    let own_call = !calls_only
+        && (ctx.tool_name.is_some()
+            || jamjet_policy::allowed_tools::RUN_TIME_TARGET_TAGS
+                .contains(&ctx.node_kind_tag.as_str()));
+    let batch = if is_dispatch {
+        jamjet_policy::dispatch::read_pending_tool_calls(&dispatch_guard::payload_input(payload))
+            .map(|c| c.len())
+            .map_err(dispatch_guard::unreadable_rule)?
+    } else {
+        0
+    };
+    Ok(u32::try_from(batch)
+        .unwrap_or(u32::MAX)
+        .saturating_add(u32::from(own_call)))
 }
 
 /// The agent card half of the decision. `Ok(None)`: every agent the node
@@ -461,6 +649,8 @@ async fn agent_card(
                 });
             }
         };
+        gate.agents
+            .push((agent_ref.to_string(), card.constraints.clone()));
         let Some(c) = card.constraints.as_ref() else {
             continue;
         };
@@ -596,6 +786,7 @@ pub async fn require_approval(
     deadline: Option<ApprovalDeadline>,
     tenant_id: &str,
     sealer: Option<&dyn ApprovalSealer>,
+    escalation: bool,
 ) -> GuardOutcome {
     let gated = vec![tool_name.clone()];
     let events = match backend.get_events(execution_id).await {
@@ -639,7 +830,12 @@ pub async fn require_approval(
     };
     let current = basis.digest(node_id);
 
-    if approval_covers(&status, &current) {
+    // A step past an agent's limit needs an approval of a request that
+    // showed the limit, and each such approval releases one step: a failed
+    // step's retry has the same digest, and must ask again.
+    let covers = approval_covers(&status, &current)
+        && (!escalation || crate::agent_limits::unused_escalation(&events, node_id).is_some());
+    if covers {
         info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
         return GuardOutcome::Allow;
     }
@@ -841,4 +1037,45 @@ pub(crate) fn basis_preview(payload: &Value, step: u64, node_def: &NodeDef) -> V
             "policy": node_def.policy,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn dispatch_node() -> NodeDef {
+        serde_json::from_value(json!({ "id": "n1", "kind": {
+            "type": "python_fn",
+            "module": "jamjet.agents.tool_runtime",
+            "function": "dispatch_tool_calls",
+            "output_schema": "",
+            "agent_tool_dispatch": true
+        }}))
+        .expect("dispatch node must deserialize")
+    }
+
+    #[test]
+    fn a_readable_batch_counts_each_call() {
+        let payload = json!({"input": {"tool_calls": [
+            {"id": "c1", "name": "lookup", "arguments": {}},
+            {"id": "c2", "name": "lookup", "arguments": {}}
+        ]}});
+        assert_eq!(step_tool_calls(&dispatch_node(), &payload), Ok(2));
+    }
+
+    #[test]
+    fn an_unreadable_batch_is_refused_not_counted_as_zero() {
+        for input in [
+            json!(null),
+            json!({"tool_calls": "send_wire"}),
+            json!({"tool_calls": [null]}),
+        ] {
+            let payload = json!({ "input": input });
+            assert!(
+                step_tool_calls(&dispatch_node(), &payload).is_err(),
+                "unreadable batch {payload} must not count as a number of calls"
+            );
+        }
+    }
 }

@@ -30,6 +30,7 @@ import asyncio
 import enum
 import importlib.metadata
 import json
+import math
 import re
 import sys
 import time
@@ -1757,6 +1758,24 @@ def workers(
     asyncio.run(_workers())
 
 
+def _reported_usage(output: dict[str, Any]) -> dict[str, Any]:
+    """Token usage and cost a node reports in its output, for the engine to
+    charge to the agent the node acts for. Only values that are a spend are
+    forwarded: non-negative integers below 2**64 for tokens (the engine reads
+    a u64 and refuses the whole result otherwise), a non-negative finite number
+    for cost (a negative cost would refund an agent's budget, and the engine
+    refuses one). Booleans are not numbers here."""
+    usage: dict[str, Any] = {}
+    for key in ("input_tokens", "output_tokens"):
+        v = output.get(key)
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**64:
+            usage[key] = v
+    cost = output.get("cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
+        usage["cost_usd"] = float(cost)
+    return usage
+
+
 async def _worker_loop(
     client: Any,
     worker_id: str,
@@ -1926,9 +1945,11 @@ async def _worker_loop(
                 # Forward optional GenAI telemetry if the tool surfaced it.
                 gen_ai_model_field: str | None = None
                 finish_reason_field: str | None = None
+                usage: dict[str, Any] = {}
                 if isinstance(output, dict):
                     gen_ai_model_field = output.get("gen_ai_model") or None
                     finish_reason_field = output.get("finish_reason") or None
+                    usage = _reported_usage(output)
 
                 try:
                     await client.complete_work_item(
@@ -1945,6 +1966,7 @@ async def _worker_loop(
                         # 0/absent, keeping the unfenced fallback backward-compatible.
                         lease_fence=lease["fence"],
                         idempotency_key=idempotency_key,
+                        **usage,
                     )
                 except Exception as complete_exc:
                     # A 409 means our echoed fence no longer matches: the lease was
