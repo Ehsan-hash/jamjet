@@ -288,6 +288,98 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `audit_seal_failed` or `run_stalled` at all, so do not roll back past this release on
   a store a newer build has written.
 
+- **An agent's `allowed_tools` is enforced.** The Agent Card's
+  `constraints.allowed_tools` (RFC-005) was stored and never checked, while the security
+  guide said the runtime enforced it. A workflow or node now names the agent it acts for
+  with `agent_ref` (the card's `uri`) in its IR, and the shared guard that both
+  transports run (`POST /work-items/claim` and the in-process worker, and the
+  completion gate) refuses any node whose tool is not on that agent's list. The refusal
+  is a `PolicyViolation` with scope `agent` and a rule starting `agent allowed_tools`,
+  and the node fails like any other policy block.
+  - What is matched: an `mcp_tool`, `tool` or `finalizer` node's tool, an `a2a_task`
+    skill, an `agent` node's agent, an `agent_tool` node's explicit agent, and a
+    function node's handler, never its node id. For an ADK agent's tool dispatch, each
+    call's name and the code its `tools` entry resolves to must both be on the list. A
+    pattern with a path in it (`app.tools:*`, `bank.wires.send_wire`) is matched against
+    the handler as written and in dotted form; a bare name pattern only against the
+    function's own name, so `read_*` does not reach `read_utils:delete_everything`.
+    `["search_web"]` allows the compiler's `search_web -> app.tools:search_web` and
+    refuses a call named `search_web` whose code is a function with another name. A
+    tool registered under a custom name needs its function listed too, but only while
+    the run's `tools` map has an entry for it: whoever starts the run seeds that map,
+    and a call with no entry is matched on its name alone. Nodes that choose their
+    target at run time (`coordinator`, `agent_discovery`, an `auto` agent tool) are
+    refused under a list. Model and condition nodes are not tool uses.
+  - A `finalizer` node is now named by its `tool_ref`, for policy too: it runs that
+    tool, and had no name, so neither `blocked_tools` nor `require_approval_for` could
+    match it.
+  - An absent or empty list restricts nothing. The card cannot tell "not set" from
+    "set to nothing", and stored cards carry `[]` meaning "not set". To refuse every
+    tool, use a policy `blocked_tools: ["*"]`.
+  - It is an additional restriction: tenant, workflow and node policy still apply,
+    and a policy that allows a tool does not override the list. A node acting for two
+    agents (workflow and node `agent_ref`) must be on both lists.
+  - Fails closed: a node acting for an agent that is not registered, or run by a
+    worker with no agent registry, is refused; an unreadable registry holds the node
+    without recording a denial. `WorkerPool::with_agents` hands the registry to every
+    worker, and the server now does so for its embedded workers, which also turns on
+    their autonomy limit checks for `agent` nodes.
+  - `AutonomyConstraints` fields are all optional on input now, so a card can carry
+    only `allowed_tools`. The in-memory agent registry refuses a second card at a URI
+    already registered, as the SQLite registry already did, so a later card cannot
+    shadow the one that restricts a node.
+  - The card's own `blocked_tools` and `require_approval_for` are enforced at the same
+    step, matched the same way (a call by its name or its resolved code; bare names
+    against a function's own name). A card block refuses the node even if the tool is
+    on the card's `allowed_tools`, and records a violation with scope `agent` and a rule
+    starting `agent blocked_tools`. A card gate holds the node through the ordinary
+    approval request (bound to the action digest, with the policy chain's deadline),
+    including a node no policy gates. For an ADK dispatch, gated calls go through the
+    per-call request a chain gate raises: it lists every gated call (card and chain) with
+    its arguments and binds them, and a chain block on any call in the batch refuses it
+    before anyone is asked. Both are additional to tenant, workflow and node policy. A
+    node that picks its target at run time is treated as named by any non-empty card
+    list: a card block list refuses it, a card gate list gates it.
+  - The card's `allowed_delegations` is enforced at the same step. A delegation is an
+    `agent` node (its `agent_ref`), an `agent_tool` with an explicit target (that URI)
+    or an `a2a_task` (the URL its `remote_agent` maps to in the workflow's
+    `remote_agents`, since the author writes both the name and the mapping; a name with
+    no entry is refused); the target must match a pattern on a non-empty list, or the node is refused
+    with a rule starting `agent allowed_delegations`. A coordinator, agent discovery or
+    `auto` agent tool picks its target at run time and is refused under a list. An
+    empty list restricts nothing. A subgraph runs a child workflow, not an agent, and
+    is not checked.
+  - Known limits: the agent's status is not consulted (a deactivated agent's nodes run
+    under its list). Cards are global, not per tenant, and the first card registered at
+    a URI wins, including one registered through `POST /agents/discover`; this engine
+    accepts only the `default` tenant, so whoever can register agents is as trusted as
+    whoever registers workflows. Attribution does not carry into a subgraph's child
+    workflow. In the Python SDK, `Agent(agent_ref=...)` and YAML `agent_ref:` (workflow)
+    / `acts_for:` (node) set it.
+  - The docs now say what the rest of the card does, because several pages claimed more
+    than the runtime does: `token_budget` and `cost_budget_usd` are checked only for a
+    `bounded_autonomous` card on an `agent` node calling it, in the in-process worker;
+    `max_iterations` and `max_tool_calls` are compared with counters the runtime never
+    increments, so a limit above 0 never trips (a limit of 0 always does); `time_budget_secs` is never read; the error circuit
+    breaker never trips; nothing routes an autonomy escalation to a human or a
+    supervisor; and no tool compiles an `agents.yaml` into a card. See "What each
+    constraint does" in docs/guides/agent-model-guide.md.
+
+- **The audit log can be signed with Ed25519, so a third party can verify it.** HMAC
+  signing uses one shared key, so anyone who can verify the log can also forge it. With
+  `JAMJET_AUDIT_SIGNING_MODE=ed25519` and a 32-byte seed in
+  `JAMJET_AUDIT_ED25519_KEY_FILE` (or `JAMJET_AUDIT_ED25519_KEY`), every entry is signed
+  with a key only the runtime holds, and the public key is published in
+  `/.well-known/did.json` (`#audit-key`). `jamjet.runtime_audit` in the Python SDK and
+  `AuditSigner::ed25519_verifier` in Rust verify a `GET /audit` export offline. The
+  signature covers a JCS statement naming the entry hash, the key id and
+  `jamjet.audit.entry/v1`. HMAC stays the default and is unchanged; a bad Ed25519 key
+  leaves entries unsigned rather than falling back to HMAC, and the key is never logged
+  or served. Prefer the key file: an inline key stays in the environment child
+  processes inherit, and a key file others can read draws a warning. An entry verifies
+  only under the key that signed it, so keep old public keys after a rotation. See
+  docs/guides/security.md, "Signing the audit log".
+
 ### Fixed
 
 - **Runtime: an unmatched API request is a JSON 404, not the web UI.** The SPA

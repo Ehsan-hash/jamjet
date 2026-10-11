@@ -151,6 +151,7 @@ pub async fn guard_dispatch(
         // No audit log here: the transports go through `node_guard::guard_item`,
         // which seals the requests it raises.
         None,
+        &[],
     )
     .await
 }
@@ -173,6 +174,7 @@ pub(crate) async fn guard_dispatch_in(
     payload_input: &Value,
     node_approved: bool,
     sealer: Option<&dyn jamjet_state::approvals::ApprovalSealer>,
+    card_gated: &[String],
 ) -> DispatchGuardOutcome {
     let fire = mode == GuardMode::Fire;
     // Load tenant policy (sits between global and workflow in the chain).
@@ -226,7 +228,11 @@ pub(crate) async fn guard_dispatch_in(
     if let Some(p) = &node_def.policy {
         sets.push(p);
     }
-    if sets.is_empty() {
+    // `card_gated`: calls an agent card's `require_approval_for` names. They
+    // are gated here, through the same per-call request as a chain gate, so
+    // the approver sees every call and its arguments, and a chain block on
+    // any call in the batch is refused before anyone is asked to approve.
+    if sets.is_empty() && card_gated.is_empty() {
         return DispatchGuardOutcome::Allow;
     }
 
@@ -260,7 +266,25 @@ pub(crate) async fn guard_dispatch_in(
         }
     };
 
-    match jamjet_policy::dispatch::evaluate_dispatch(node_id, &calls, &sets) {
+    let decision = match jamjet_policy::dispatch::evaluate_dispatch(node_id, &calls, &sets) {
+        DispatchDecision::Allow if !card_gated.is_empty() => DispatchDecision::RequireApproval {
+            approver: "human".to_string(),
+            gated: card_gated.to_vec(),
+        },
+        DispatchDecision::RequireApproval {
+            approver,
+            mut gated,
+        } => {
+            for name in card_gated {
+                if !gated.contains(name) {
+                    gated.push(name.clone());
+                }
+            }
+            DispatchDecision::RequireApproval { approver, gated }
+        }
+        other => other,
+    };
+    match decision {
         DispatchDecision::Allow => DispatchGuardOutcome::Allow,
 
         DispatchDecision::Block { tool_name, reason } => {
@@ -593,7 +617,7 @@ fn tool_ctx(node_id: &str, tool_name: &str) -> EvaluationContext {
 /// phrase cannot drift on one cause and quietly stop matching: the decision is
 /// identical for all of them, so anything keyed on the family must keep
 /// matching, while the Prove surface gains the cause.
-fn unreadable_rule(cause: UnreadableCalls) -> String {
+pub(crate) fn unreadable_rule(cause: UnreadableCalls) -> String {
     let detail = match cause {
         UnreadableCalls::NotAnObject => "input is not an object",
         UnreadableCalls::NotAList => "the call list is not an array",
@@ -853,6 +877,7 @@ mod tests {
                 input,
                 false,
                 None,
+                &[],
             )
             .await
         }
@@ -1369,6 +1394,7 @@ mod tests {
             node_def,
             &json!({ "input": input_for(&["send_wire"]) }),
             Some(&sealer),
+            Default::default(),
         )
         .await;
         assert!(

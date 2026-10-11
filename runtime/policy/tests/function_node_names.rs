@@ -252,3 +252,32 @@ fn an_mcp_tool_node_is_named_by_its_tool() {
         Some("delete_table")
     );
 }
+
+/// A `finalizer` node runs the tool its `tool_ref` names (claimed off the
+/// `tool` queue), so it is named by that tool. It had no name, so no
+/// `blocked_tools` pattern and no agent `allowed_tools` list could see it.
+#[test]
+fn a_finalizer_node_is_named_by_its_tool() {
+    let fin = NodeKind::Finalizer {
+        tool_ref: "send_wire".into(),
+        run_on: jamjet_core::node::FinalizerTrigger::Always,
+    };
+    assert!(blocked(&decide("x", &fin, &block(&["send_*"]))));
+    assert_eq!(
+        EvaluationContext::from_node_kind("x", &fin)
+            .tool_name
+            .as_deref(),
+        Some("send_wire")
+    );
+}
+
+/// An `agent_tool` node with an explicit target is named by that agent.
+#[test]
+fn an_agent_tool_node_is_named_by_its_agent() {
+    let at: NodeKind = serde_json::from_value(serde_json::json!({
+        "type": "agent_tool", "agent": { "explicit": "https://x.example/wire" },
+        "output_key": "o", "timeout_ms": null, "budget": null
+    }))
+    .unwrap();
+    assert!(blocked(&decide("x", &at, &block(&["https://x.example/*"]))));
+}
