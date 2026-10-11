@@ -30,6 +30,7 @@ import asyncio
 import enum
 import importlib.metadata
 import json
+import re
 import sys
 import time
 from collections.abc import Mapping
@@ -2542,12 +2543,148 @@ def _effect_size_label(d: float) -> str:
 # ── approvals ─────────────────────────────────────────────────────────────────
 
 
+# Bidi controls that reorder what follows them on the terminal.
+_BIDI_CONTROLS = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def _safe(value: Any) -> str:
+    """`value` as text that cannot drive the terminal.
+
+    Node ids, tool names, input keys and values, and decided users and comments
+    come from whoever started the run or decided it. An ESC sequence in one
+    could move the cursor and rewrite the reviewer's lines (an approve command,
+    what a digest covers), and a bidi override could reorder them. Every C0 and
+    C1 control, DEL and bidi control is shown escaped (`\\x1b`, `\\u202e`).
+    """
+    out = []
+    for ch in str(value):
+        code = ord(ch)
+        if code < 0x20 or 0x7F <= code <= 0x9F:
+            out.append(f"\\x{code:02x}")
+        elif ch in _BIDI_CONTROLS:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _cell(value: Any) -> Any:
+    """A table cell that shows `value` literally: escaped, and never read as markup."""
+    from rich.text import Text
+
+    return Text(_safe(value))
+
+
+def _short(value: Any, limit: int = 40) -> str:
+    """A bounded, escaped rendering of one value for the summary line."""
+    text = _safe(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _bounded(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _summary(data: dict[str, Any], limit: int = 240) -> str:
+    """`key=value, ...` for a dict, each key, each value and the whole line
+    bounded, so no one key or value can fill the line and hide the rest."""
+    parts = [f"{_bounded(_safe(k), 32)}={_short(v)}" for k, v in sorted(data.items())]
+    line = ", ".join(parts) or "(empty)"
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+# The node id rule `POST /workflows` enforces. A workflow stored before that
+# rule may still have another id; no paste-ready command is printed for it,
+# because POSIX quoting does not protect every shell (fish among them).
+_NODE_ID_SAFE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+
+
+def _approve_command(execution_id: str, node_id: str, binding: str) -> str | None:
+    """The `jamjet approve` line for one pending request, safe to paste.
+
+    The node id is chosen by whoever wrote the IR. Every argument is shell
+    quoted, options are written `--opt=value` so a value starting with `-` is
+    never read as an option, and the line holds the command alone (the label
+    is printed on the line before). `None` when a value holds characters
+    `_safe` would have to escape: a terminal control sequence cannot be shown
+    inside a paste-ready command.
+    """
+    import shlex  # noqa: PLC0415
+
+    values = (execution_id, node_id, binding)
+    if any(_safe(v) != str(v) for v in values) or not _NODE_ID_SAFE.fullmatch(node_id):
+        return None
+    args = [
+        "jamjet",
+        "approve",
+        execution_id,
+        "--decision",
+        "approved",
+        f"--node-id={node_id}",
+        f"--action-digest={binding}",
+    ]
+    return " ".join(shlex.quote(a) for a in args)
+
+
+def _approval_binding(context: dict[str, Any]) -> str | None:
+    """The value `jamjet approve --action-digest` must echo for a pending request:
+    its action digest, or for an agent tool dispatch its calls hash."""
+    return context.get("action_digest") or context.get("calls_hash")
+
+
+def _call_label(call: dict[str, Any]) -> str:
+    """A call's name, and the code it resolves to when the run's tools map names it."""
+    name = _safe(call.get("name", "?"))
+    handler = call.get("handler")
+    return f"{name} -> {_safe(handler)}" if handler else name
+
+
+def _calls_summary(calls: list[Any]) -> str:
+    rendered = [f"{_call_label(c)}({_short(c.get('arguments', {}))})" for c in calls if isinstance(c, dict)]
+    line = ", ".join(rendered) or "(none)"
+    return line if len(line) <= 240 else line[:239] + "…"
+
+
+def _approval_covers(context: dict[str, Any]) -> str:
+    """One line on what a pending request's binding covers: bounded values,
+    not only key names, so the line itself shows what would run."""
+    basis = context.get("action_basis")
+    if isinstance(basis, dict):
+        parts = [f"step {_safe(basis.get('step', '?'))}"]
+        payload = basis.get("payload")
+        calls = payload.get("calls") if isinstance(payload, dict) else None
+        if isinstance(calls, list):
+            parts.append(f"calls: {_calls_summary(calls)}")
+        elif basis.get("payload_truncated"):
+            parts.append(f"payload {_safe(basis.get('payload_bytes', '?'))} bytes, too large to show")
+        elif isinstance(payload, dict):
+            data = payload.get("input", payload.get("state"))
+            if isinstance(data, dict):
+                parts.append(f"input: {_summary(data)}")
+            parts.append(f"payload {_safe(basis.get('payload_bytes', '?'))} bytes")
+        return "; ".join(parts)
+    calls = context.get("calls")
+    if context.get("calls_hash") and isinstance(calls, list):
+        return f"calls: {_calls_summary(calls)}"
+    return "-"
+
+
 @app.command()
 def approvals(
     execution_id: str = typer.Argument(..., help="Execution ID (exec_...)"),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+    show_basis: bool = typer.Option(
+        False,
+        "--show-basis",
+        help="Print the full action basis each pending digest covers (the payload the node runs on).",
+    ),
 ) -> None:
-    """List pending and decided approvals for an execution."""
+    """List pending and decided approvals for an execution.
+
+    Each pending request shows the digest to approve it with and what that
+    digest covers. Review the basis (`--show-basis`) before approving: the
+    approval authorises exactly that payload, that occurrence and that node.
+    """
 
     async def _approvals() -> None:
         async with _client(runtime) as c:
@@ -2557,23 +2694,73 @@ def approvals(
         decided = data.get("decided", [])
 
         if not pending and not decided:
-            console.print(f"[dim]No approvals on {execution_id}.[/dim]")
+            console.print(f"No approvals on {_safe(execution_id)}.", style="dim", markup=False)
             return
 
         if pending:
-            t = Table(title=f"Pending approvals - {execution_id}")
+            t = Table(title=_cell(f"Pending approvals - {execution_id}"))
             t.add_column("Node", style="bold")
             t.add_column("Tool")
             t.add_column("Approver")
             t.add_column("Seq", style="dim", justify="right")
             for entry in pending:
                 t.add_row(
-                    entry.get("node_id", "-"),
-                    entry.get("tool_name", "-"),
-                    entry.get("approver", "-"),
-                    str(entry.get("sequence", "")),
+                    _cell(entry.get("node_id", "-")),
+                    _cell(entry.get("tool_name", "-")),
+                    _cell(entry.get("approver", "-")),
+                    _cell(entry.get("sequence", "")),
                 )
             console.print(t)
+            # Digests are printed outside the table, whole and unwrapped: they
+            # must be copied exactly, and a table column would truncate them.
+            for entry in pending:
+                context = entry.get("context") or {}
+                node = _safe(entry.get("node_id", "-"))
+                binding = _approval_binding(context)
+                binding = _safe(binding) if binding else None
+                console.print(
+                    f"{node}: covers {_approval_covers(context)}",
+                    soft_wrap=True,
+                    markup=False,
+                    highlight=False,
+                )
+                if binding:
+                    command = _approve_command(execution_id, entry.get("node_id", ""), binding)
+                    console.print(
+                        f"{node}: approve with"
+                        if command
+                        else f"{node}: the node id is not in the safe set [A-Za-z0-9_.-] or a value "
+                        "holds control characters, so no command is printed; approve it with "
+                        "the API or SDK, passing the node id exactly",
+                        soft_wrap=True,
+                        markup=False,
+                        highlight=False,
+                    )
+                    if command:
+                        console.print(
+                            f"  {command}",
+                            soft_wrap=True,
+                            markup=False,
+                            highlight=False,
+                        )
+                else:
+                    console.print(
+                        f"{node}: no digest (a request from before digests were recorded; "
+                        "approving it authorises nothing, the node asks again)",
+                        soft_wrap=True,
+                        markup=False,
+                        highlight=False,
+                    )
+                if show_basis:
+                    basis = context.get("action_basis")
+                    if basis is None and context.get("calls_hash"):
+                        basis = {"calls": context.get("calls"), "gated_tools": context.get("gated_tools")}
+                    console.print(
+                        json.dumps(basis, indent=2, sort_keys=True),
+                        soft_wrap=True,
+                        markup=False,
+                        highlight=False,
+                    )
 
         if decided:
             d = Table(title="Decided")
@@ -2585,11 +2772,11 @@ def approvals(
             for entry in decided:
                 comment = entry.get("comment", "")
                 d.add_row(
-                    entry.get("node_id", "-"),
-                    entry.get("status", "-"),
-                    entry.get("user_id", "-"),
-                    comment if comment else "",
-                    str(entry.get("sequence", "")),
+                    _cell(entry.get("node_id", "-")),
+                    _cell(entry.get("status", "-")),
+                    _cell(entry.get("user_id", "-")),
+                    _cell(comment if comment else ""),
+                    _cell(entry.get("sequence", "")),
                 )
             console.print(d)
 
@@ -2605,6 +2792,12 @@ def approve(
     decision: str = typer.Option(..., "--decision", "-d", help="approved or rejected"),
     node_id: str | None = typer.Option(None, "--node-id", help="Node to approve (inferred when one is pending)"),
     comment: str | None = typer.Option(None, "--comment", "-c", help="Optional comment"),
+    action_digest: str | None = typer.Option(
+        None,
+        "--action-digest",
+        help="action_digest (or calls_hash) of the pending approval you reviewed, from "
+        "`jamjet approvals`. Required to approve on a runtime with auth enabled.",
+    ),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
 ) -> None:
     """Approve or reject a pending HITL gate on an execution."""
@@ -2624,19 +2817,28 @@ def approve(
                     decision,
                     node_id=node_id,
                     comment=comment,
+                    action_digest=action_digest,
                 )
             except httpx.HTTPStatusError as exc:
                 try:
                     msg = exc.response.json().get("error") or exc.response.text
                 except Exception:
                     msg = exc.response.text
-                console.print(f"[red]Error:[/red] {msg}")
+                # The message can quote run-supplied text (a node id): escaped,
+                # and never read as markup.
+                console.print("Error:", style="red", end=" ")
+                console.print(_safe(msg), markup=False, highlight=False, soft_wrap=True)
                 raise typer.Exit(1) from exc
 
-        resolved = result.get("node_id", "?")
+        resolved = _safe(result.get("node_id", "?"))
         accepted = result.get("accepted", decision == "approved")
-        status_str = "[green]approved[/green]" if accepted else "[red]rejected[/red]"
-        console.print(f"{status_str}  node=[bold]{resolved}[/bold]  execution={execution_id}")
+        console.print("approved" if accepted else "rejected", style="green" if accepted else "red", end="  ")
+        console.print(
+            f"node={resolved}  execution={_safe(execution_id)}",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
 
     asyncio.run(_approve())
 

@@ -43,6 +43,17 @@ pub enum IrError {
     #[error("node '{0}' dispatches ADK agent tool calls but is not marked agent_tool_dispatch, so tool policy would not be enforced for it")]
     UnmarkedAgentToolDispatch(String),
 
+    #[error("node id {0:?} is not allowed: a node id is 1 to 128 ASCII letters, digits, '_', '.' or '-'")]
+    InvalidNodeId(String),
+
+    #[error(
+        "node key '{key}' does not match its id '{id}'; a node's id must equal its key in `nodes`"
+    )]
+    NodeIdMismatch { key: String, id: String },
+
+    #[error("node '{0}' sets agent_tool_dispatch but is not the ADK tool dispatcher ({1}); the flag is reserved for jamjet.agents.tool_runtime:dispatch_tool_calls")]
+    MisplacedAgentToolDispatch(String, String),
+
     #[error("node '{0}' is unreachable from the start node")]
     UnreachableNode(String),
 

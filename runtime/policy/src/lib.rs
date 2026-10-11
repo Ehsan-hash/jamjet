@@ -40,6 +40,71 @@ pub struct EvaluationContext {
     pub model_ref: Option<String>,
 }
 
+/// Node kinds whose code is named by a handler reference, not a tool. For these
+/// the node id is a policy name too.
+pub const FUNCTION_KIND_TAGS: &[&str] = &["python_fn", "java_fn", "external_fn"];
+
+/// The evaluation tag for a Python `module:function` reference that is not a
+/// node: the handler an agent tool call resolves to through the run's `tools`
+/// map. Matched like a `python_fn` handler (literal and canonical dotted form),
+/// but with no node id as a second name.
+pub const PYTHON_REF_TAG: &str = "python_ref";
+
+impl EvaluationContext {
+    /// Every name `blocked_tools` and `require_approval_for` patterns are
+    /// matched against: the tool name, and for code-backed kinds
+    /// ([`FUNCTION_KIND_TAGS`]) also the node id. A pattern applies if it
+    /// matches any of them. Other kinds are not matched on their node id, so
+    /// existing tool policies keep their meaning.
+    pub fn policy_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.tool_name.iter().map(String::as_str).collect();
+        if FUNCTION_KIND_TAGS.contains(&self.node_kind_tag.as_str()) {
+            names.push(self.node_id.as_str());
+        }
+        names
+    }
+
+    /// The handler reference of a code-backed node as a canonical dotted
+    /// path, or `None` for any other kind. The Python worker resolves
+    /// `function` as an attribute chain, so `payments.transfer:send` and
+    /// `payments:transfer.send` run the same code; both canonicalise to
+    /// `payments.transfer.send`. A Java `class/method` becomes `class.method`.
+    /// An external handler is opaque to the engine and has no canonical form.
+    ///
+    /// This closes re-spellings of one dotted path, not aliases: a module that
+    /// re-exports the function (`myapp.api:send`) names the same code under a
+    /// different path, and no name pattern can see that.
+    pub fn canonical_handler(&self) -> Option<String> {
+        let name = self.tool_name.as_deref()?;
+        match self.node_kind_tag.as_str() {
+            "python_fn" | PYTHON_REF_TAG => Some(name.replace(':', ".")),
+            "java_fn" => Some(name.replace('/', ".")),
+            _ => None,
+        }
+    }
+
+    /// Whether `pattern` names this node: it matches one of
+    /// [`Self::policy_names`] as written, or, for a code-backed node, its
+    /// canonical form matches [`Self::canonical_handler`].
+    pub fn matches(&self, pattern: &str) -> Option<String> {
+        if let Some(name) = self
+            .policy_names()
+            .into_iter()
+            .find(|n| glob_match(pattern, n))
+        {
+            return Some(name.to_string());
+        }
+        let canonical = self.canonical_handler()?;
+        glob_match(&canonical_pattern(pattern), &canonical).then_some(canonical)
+    }
+}
+
+/// A handler pattern in canonical dotted form: `:` and `/` become `.`, so a
+/// pattern in either spelling matches [`EvaluationContext::canonical_handler`].
+fn canonical_pattern(pattern: &str) -> String {
+    pattern.replace([':', '/'], ".")
+}
+
 // ── PolicyEvaluator ────────────────────────────────────────────────────────
 
 /// Merges policy sets from most-general (global) to most-specific (node) and
@@ -79,25 +144,21 @@ impl PolicyEvaluator {
                 return PolicyDecision::Allow;
             }
 
-            // 2. Blocked tools check.
-            if let Some(tool_name) = &ctx.tool_name {
-                for pattern in &policy.blocked_tools {
-                    if glob_match(pattern, tool_name) {
-                        return PolicyDecision::Block {
-                            reason: format!(
-                                "tool '{tool_name}' matches blocked pattern '{pattern}'"
-                            ),
-                        };
-                    }
+            // 2. Blocked tools check, then 3. require-approval, over every
+            // name the node answers to, including a code-backed node's
+            // canonical handler path.
+            for pattern in &policy.blocked_tools {
+                if let Some(name) = ctx.matches(pattern) {
+                    return PolicyDecision::Block {
+                        reason: format!("tool '{name}' matches blocked pattern '{pattern}'"),
+                    };
                 }
-
-                // 3. Require-approval check.
-                for pattern in &policy.require_approval_for {
-                    if glob_match(pattern, tool_name) {
-                        return PolicyDecision::RequireApproval {
-                            approver: "human".to_string(),
-                        };
-                    }
+            }
+            for pattern in &policy.require_approval_for {
+                if ctx.matches(pattern).is_some() {
+                    return PolicyDecision::RequireApproval {
+                        approver: "human".to_string(),
+                    };
                 }
             }
         }

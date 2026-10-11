@@ -60,6 +60,11 @@ pub enum EventKind {
         workflow_id: String,
         workflow_version: String,
         initial_input: serde_json::Value,
+        /// Principal that started the run (`"token:<ApiToken.id>"`), used for
+        /// separation of duties on approvals. A continue-as-new segment carries
+        /// its run's initiator forward. `None` in dev mode and on old logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initiated_by: Option<String>,
     },
     WorkflowCompleted {
         final_state: serde_json::Value,
@@ -160,10 +165,29 @@ pub enum EventKind {
     },
     ApprovalReceived {
         node_id: NodeId,
+        /// Display name of the approver. With auth on, the API token's name; in
+        /// dev mode, whatever the caller supplied.
         user_id: String,
         decision: ApprovalDecision,
         comment: Option<String>,
         state_patch: Option<serde_json::Value>,
+        /// Authenticated identity behind the decision, `"token:<ApiToken.id>"`.
+        /// `None` in dev mode (no auth) and on events written before it existed.
+        /// Unlike `user_id` it is unique and not caller-chosen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<String>,
+        /// The `action_digest` this approval authorises (see
+        /// `approvals::action_digest`). Equals the request's digest, or, when
+        /// the approver supplied a `state_patch`, the digest of the patched
+        /// state. The worker fires only if the digest it computes at resume
+        /// matches. `None` on rejections, on approvals of requests that carry
+        /// no digest, and on old logs; a `None` never authorises a digest-bound
+        /// node.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved_digest: Option<String>,
+        /// Sequence of the `ToolApprovalRequired` this decision answers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_sequence: Option<i64>,
     },
 
     // ── Timers ────────────────────────────────────────────────────────────

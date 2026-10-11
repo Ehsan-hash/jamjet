@@ -7,7 +7,9 @@
 //! iff its latest `ToolApprovalRequired` has no later `ApprovalReceived`.
 
 use crate::event::{ApprovalDecision, EventKind};
+use crate::hashing::content_hash;
 use crate::{Event, EventSequence};
+use jamjet_core::workflow::ExecutionId;
 use serde::Serialize;
 
 /// A `ToolApprovalRequired` that has not been decided yet.
@@ -20,6 +22,22 @@ pub struct PendingApproval {
     pub sequence: EventSequence,
 }
 
+impl PendingApproval {
+    /// The `action_digest` the request was made for, if it carries one.
+    pub fn action_digest(&self) -> Option<&str> {
+        self.context.get(ACTION_DIGEST_KEY).and_then(|d| d.as_str())
+    }
+
+    /// What this request binds, for a decider to echo: the `action_digest`
+    /// (every request made since dispatch requests were bound to it), or for
+    /// an older agent tool dispatch request the `calls_hash` it carried.
+    /// `None` for a legacy request that binds nothing.
+    pub fn binding(&self) -> Option<&str> {
+        self.action_digest()
+            .or_else(|| self.context.get(CALLS_HASH_KEY).and_then(|d| d.as_str()))
+    }
+}
+
 /// Approval status of a single node, derived from the event log.
 #[derive(Debug, Clone)]
 pub enum NodeApprovalStatus {
@@ -28,6 +46,9 @@ pub enum NodeApprovalStatus {
     Approved {
         user_id: String,
         sequence: EventSequence,
+        /// The action digest the approval authorises; `None` for a legacy
+        /// approval or one answering a request with no digest.
+        approved_digest: Option<String>,
     },
     Rejected {
         user_id: String,
@@ -60,6 +81,7 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
                 user_id,
                 decision,
                 comment,
+                approved_digest,
                 ..
             } if n == node_id => {
                 // A decision only resolves an outstanding request.
@@ -68,6 +90,7 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
                         ApprovalDecision::Approved => NodeApprovalStatus::Approved {
                             user_id: user_id.clone(),
                             sequence: event.sequence,
+                            approved_digest: approved_digest.clone(),
                         },
                         ApprovalDecision::Rejected => NodeApprovalStatus::Rejected {
                             user_id: user_id.clone(),
@@ -81,6 +104,225 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
         }
     }
     status
+}
+
+/// Context key under which a hold records the digest of the action it parks.
+pub const ACTION_DIGEST_KEY: &str = "action_digest";
+
+/// Context key under which an agent tool dispatch hold records the hash of the
+/// calls it parks (`workers::dispatch_guard`).
+pub const CALLS_HASH_KEY: &str = "calls_hash";
+
+/// Context key under which a hold records what it binds, for a reviewer: the
+/// payload the node will be dispatched with (size-capped), the occurrence and
+/// the node.
+pub const ACTION_BASIS_KEY: &str = "action_basis";
+
+/// Largest serialized payload shown in [`ACTION_BASIS_KEY`]. Above it the
+/// preview is dropped (never cut mid-value) and flagged; the digest still
+/// covers the whole payload.
+pub const ACTION_BASIS_STATE_CAP: usize = 16 * 1024;
+
+/// Context key under which a hold records which occurrence of the node it is
+/// for: the node's completion count when the request was made.
+pub const ACTION_STEP_KEY: &str = "action_step";
+
+/// The request the node's current decision answered: its latest
+/// `ToolApprovalRequired`, if the node has a decision. `None` while the latest
+/// request is still pending or there has never been one.
+pub fn answered_request(events: &[Event], node_id: &str) -> Option<PendingApproval> {
+    match node_approval_status(events, node_id) {
+        NodeApprovalStatus::Approved { .. } | NodeApprovalStatus::Rejected { .. } => {}
+        _ => return None,
+    }
+    events.iter().rev().find_map(|e| match &e.kind {
+        EventKind::ToolApprovalRequired {
+            node_id: n,
+            tool_name,
+            approver,
+            context,
+        } if n == node_id => Some(PendingApproval {
+            node_id: n.clone(),
+            tool_name: tool_name.clone(),
+            approver: approver.clone(),
+            context: context.clone(),
+            sequence: e.sequence,
+        }),
+        _ => None,
+    })
+}
+
+/// The digest an approval of a plain node is bound to.
+///
+/// Covers the run, the node, which occurrence of the node this is (`step`, the
+/// number of times it has already completed), the node's DEFINITION (see
+/// [`definition_hash`]) and the work item PAYLOAD the node is dispatched with
+/// (see [`action_payload`]): the exact bytes the executor or external worker
+/// receives, its `input` included. So an approval stops covering the action
+/// when the input changes after the request (a sibling commits, an upstream
+/// node writes), when the node is visited again (a loop or any re-enqueue of
+/// a completed node): `step` differs, so the old approval cannot be replayed,
+/// when the node's definition is not the one that was reviewed, and when an
+/// item for the node carries any payload other than the reviewed one.
+///
+/// The payload, not the materialized state: the scheduler builds
+/// `payload.input` with a shallow top-level fold of the run's state, the
+/// materializer deep-merges (RFC 7396), and the two disagree on nested
+/// objects and null-valued keys. Binding the materialized state showed and
+/// approved one input while the node ran on another (review I1).
+///
+/// Domain-separated from the idempotency key (`hashing::idempotency_key`).
+pub fn action_digest(
+    run: &str,
+    step: u64,
+    node: &str,
+    definition: &str,
+    payload: &serde_json::Value,
+) -> String {
+    content_hash(&serde_json::json!({
+        "domain": "jamjet.approval.action.v3",
+        "run": run,
+        "step": step,
+        "node": node,
+        "definition": definition,
+        "payload": content_hash(payload),
+    }))
+}
+
+/// Context key under which a hold records the [`definition_hash`] of the node
+/// it parks, so a reviewer (and the approve route) can see what was bound.
+pub const ACTION_DEFINITION_KEY: &str = "action_definition";
+
+/// The hash of one node's definition as registered (the IR's `NodeDef`
+/// serialized to JSON, its own policy included), in canonical JSON. Bound
+/// into [`action_digest`] so an approval never covers a different node body.
+pub fn definition_hash(node_def: &serde_json::Value) -> String {
+    content_hash(&serde_json::json!({
+        "domain": "jamjet.approval.node.v1",
+        "node": node_def,
+    }))
+}
+
+/// What an approval of one node occurrence binds: read once, shared by every
+/// caller that decides or shows it.
+#[derive(Debug, Clone)]
+pub struct ActionBasis {
+    pub run: String,
+    pub step: u64,
+    pub definition: String,
+    /// The dispatched payload, as [`action_payload`] returns it.
+    pub payload: serde_json::Value,
+}
+
+impl ActionBasis {
+    /// The digest of firing `node` on this basis.
+    pub fn digest(&self, node: &str) -> String {
+        action_digest(&self.run, self.step, node, &self.definition, &self.payload)
+    }
+}
+
+/// State keys the ENGINE itself writes, excluded from the action digest.
+///
+/// Every in-process completion writes the execution's budget bookkeeping
+/// (`BudgetState::patch_into_snapshot_state`, key `"__budget"`) into state.
+/// If the digest covered it, any sibling finishing while a gated node waited
+/// would void the node's approval, and a node on a busy parallel branch could
+/// re-request forever. These keys describe the engine's accounting, not the
+/// action, so they are left out.
+///
+/// EXACTLY the engine's keys: not every `"__"`-prefixed key, because user state
+/// may use that prefix and a change to it must still void an approval. A new
+/// engine-written key goes here, and `engine_state_keys_cover_the_budget_writer`
+/// fails if the budget writer starts writing one that is not listed.
+pub const ENGINE_STATE_KEYS: &[&str] = &["__budget"];
+
+/// `state` without the [`ENGINE_STATE_KEYS`]: what an approval binds.
+pub fn action_state(state: &serde_json::Value) -> serde_json::Value {
+    let mut state = state.clone();
+    if let Some(obj) = state.as_object_mut() {
+        for key in ENGINE_STATE_KEYS {
+            obj.remove(*key);
+        }
+    }
+    state
+}
+
+/// The part of a work item's payload an approval binds: the payload exactly
+/// as the engine dispatched it, minus the [`ENGINE_STATE_KEYS`] in the state
+/// it carries (`input` for function nodes, `state` for condition nodes).
+pub fn action_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let mut payload = payload.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        for key in ["input", "state"] {
+            if let Some(v) = obj.get_mut(key) {
+                *v = action_state(v);
+            }
+        }
+    }
+    payload
+}
+
+/// Read the [`ActionBasis`] for the next occurrence of `node_id`, dispatched
+/// with `payload` (the work item's payload): the node's completion count and
+/// [`action_payload`]. `definition` is the node's [`definition_hash`].
+///
+/// The ONE derivation of the basis. The in-process worker, the claim route,
+/// the completion check and the pending listing all go through it, so the
+/// action a reviewer approves, the one the gate compares and the one that runs
+/// are the same bytes. Errors propagate: a caller on the enforcement path must
+/// treat them as "cannot prove this is approved".
+pub async fn action_basis(
+    backend: &dyn crate::backend::StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    definition: &str,
+    payload: &serde_json::Value,
+) -> crate::backend::BackendResult<ActionBasis> {
+    let step = backend
+        .count_node_completions(execution_id, node_id)
+        .await?;
+    Ok(ActionBasis {
+        run: execution_id.to_string(),
+        step,
+        definition: definition.to_string(),
+        payload: action_payload(payload),
+    })
+}
+
+/// [`action_digest`] for the next occurrence of `node_id` dispatched with
+/// `payload`, read from the backend.
+pub async fn derive_action_digest(
+    backend: &dyn crate::backend::StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    definition: &str,
+    payload: &serde_json::Value,
+) -> crate::backend::BackendResult<String> {
+    Ok(
+        action_basis(backend, execution_id, node_id, definition, payload)
+            .await?
+            .digest(node_id),
+    )
+}
+
+/// Whether an approval status authorises firing an action whose digest is
+/// `current`. Only an `Approved` whose `approved_digest` equals `current`
+/// does; a missing digest (legacy approval) never does.
+pub fn approval_covers(status: &NodeApprovalStatus, current: &str) -> bool {
+    matches!(
+        status,
+        NodeApprovalStatus::Approved { approved_digest: Some(d), .. } if d == current
+    )
+}
+
+/// The principal that started this run: the FIRST `WorkflowStarted`'s
+/// `initiated_by`. `None` for a dev-mode run, a run logged before initiators
+/// were recorded, or a log with no `WorkflowStarted`.
+pub fn run_initiator(events: &[Event]) -> Option<String> {
+    events.iter().find_map(|e| match &e.kind {
+        EventKind::WorkflowStarted { initiated_by, .. } => Some(initiated_by.clone()),
+        _ => None,
+    })?
 }
 
 /// All nodes whose latest `ToolApprovalRequired` is undecided.
@@ -150,6 +392,9 @@ mod tests {
                 decision,
                 comment: Some("note".into()),
                 state_patch: None,
+                principal: None,
+                approved_digest: None,
+                request_sequence: None,
             },
         )
     }

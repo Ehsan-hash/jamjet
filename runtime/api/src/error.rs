@@ -20,6 +20,9 @@ pub enum ApiError {
 
     #[error("unauthorized")]
     Unauthorized,
+
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl IntoResponse for ApiError {
@@ -29,6 +32,7 @@ impl IntoResponse for ApiError {
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".into()),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
         (status, Json(json!({ "error": message }))).into_response()
@@ -39,6 +43,9 @@ impl From<jamjet_state::backend::StateBackendError> for ApiError {
     fn from(e: jamjet_state::backend::StateBackendError) -> Self {
         match e {
             jamjet_state::backend::StateBackendError::NotFound(msg) => Self::NotFound(msg),
+            e @ jamjet_state::backend::StateBackendError::VersionConflict(_) => {
+                Self::Conflict(e.to_string())
+            }
             other => Self::Internal(other.to_string()),
         }
     }

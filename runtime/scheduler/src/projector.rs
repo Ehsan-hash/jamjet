@@ -171,6 +171,7 @@ impl Projector {
                     user_id,
                     decision,
                     comment,
+                    approved_digest,
                     ..
                 } => {
                     // First-decision-wins: only transition a node that is
@@ -187,9 +188,11 @@ impl Projector {
                             ApprovalDecision::Approved => "approved",
                             ApprovalDecision::Rejected => "rejected",
                         };
-                        // Pending metadata (tool_name/approver/context) is
-                        // cleared on resolution — the node is no longer
-                        // waiting for a decision.
+                        // Pending metadata (tool_name/approver) is cleared on
+                        // resolution — the node is no longer waiting for a
+                        // decision. The context column keeps only what the
+                        // decision bound, so the listing's projection path
+                        // reports `approved_digest` like its event-log path.
                         node_map.insert(
                             node_id.clone(),
                             ApprovalProjectionRow {
@@ -201,7 +204,9 @@ impl Projector {
                                 last_sequence: event.sequence,
                                 tool_name: None,
                                 approver: None,
-                                context: None,
+                                context: approved_digest
+                                    .as_ref()
+                                    .map(|d| serde_json::json!({ "approved_digest": d })),
                             },
                         );
                     }
@@ -315,6 +320,9 @@ mod tests {
                 decision,
                 comment: None,
                 state_patch: None,
+                principal: None,
+                approved_digest: None,
+                request_sequence: None,
             },
         )
     }
@@ -809,6 +817,9 @@ mod tests {
                     decision: ApprovalDecision::Rejected,
                     comment: Some("exceeds limit".into()),
                     state_patch: None,
+                    principal: None,
+                    approved_digest: None,
+                    request_sequence: None,
                 },
             ))
             .await
@@ -1142,6 +1153,9 @@ mod tests {
                 decision: ApprovalDecision::Approved,
                 comment: None,
                 state_patch: None,
+                principal: None,
+                approved_digest: None,
+                request_sequence: None,
             },
         );
         let required_second = StateEvent::new(

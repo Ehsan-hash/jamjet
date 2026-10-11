@@ -567,9 +567,12 @@ impl StateBackend for SqliteBackend {
         let ir_json = serde_json::to_string(&def.ir)?;
         let created_at = def.created_at.to_rfc3339();
 
-        sqlx::query(
-            r#"INSERT OR REPLACE INTO workflow_definitions (workflow_id, version, ir_json, created_at, tenant_id)
-               VALUES (?, ?, ?, ?, ?)"#,
+        let inserted = sqlx::query(
+            // Never REPLACE: a version is immutable. A conflicting row is
+            // compared below instead of overwritten.
+            r#"INSERT INTO workflow_definitions (workflow_id, version, ir_json, created_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (tenant_id, workflow_id, version) DO NOTHING"#,
         )
         .bind(&def.workflow_id)
         .bind(&def.version)
@@ -579,8 +582,39 @@ impl StateBackend for SqliteBackend {
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
+        if inserted.rows_affected() == 1 {
+            return Ok(());
+        }
 
-        Ok(())
+        // The version exists. Same definition: an idempotent re-register.
+        // Anything else is a redefinition, refused.
+        let stored: Option<(String,)> = sqlx::query_as(
+            r#"SELECT ir_json FROM workflow_definitions
+               WHERE tenant_id = ? AND workflow_id = ? AND version = ?"#,
+        )
+        .bind(&def.tenant_id)
+        .bind(&def.workflow_id)
+        .bind(&def.version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        let Some((stored_json,)) = stored else {
+            // Lost to a concurrent delete between the two statements; there is
+            // no DELETE path today, so refuse rather than guess.
+            return Err(crate::backend::version_conflict(
+                &def.workflow_id,
+                &def.version,
+            ));
+        };
+        let stored_ir: serde_json::Value = serde_json::from_str(&stored_json)?;
+        if crate::backend::same_definition(&stored_ir, &def.ir) {
+            Ok(())
+        } else {
+            Err(crate::backend::version_conflict(
+                &def.workflow_id,
+                &def.version,
+            ))
+        }
     }
 
     #[instrument(skip(self), fields(workflow_id = workflow_id, version = version))]
@@ -2015,6 +2049,35 @@ impl StateBackend for SqliteBackend {
         Ok((token, info))
     }
 
+    /// The tenant record, policy included. The base backend is what the
+    /// scheduler and the embedded workers run on; without this they read the
+    /// trait default ("no such tenant"), so tenant policy never applied to an
+    /// in-process node while the claim route, on a tenant-scoped backend,
+    /// applied it. Reads only: tenant writes go through the scoped backend.
+    async fn get_tenant(
+        &self,
+        id: &crate::tenant::TenantId,
+    ) -> BackendResult<Option<crate::tenant::Tenant>> {
+        let row = sqlx::query("SELECT * FROM tenants WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+        row.as_ref()
+            .map(crate::tenant_scoped::row_to_tenant)
+            .transpose()
+    }
+
+    async fn list_tenants(&self) -> BackendResult<Vec<crate::tenant::Tenant>> {
+        let rows = sqlx::query("SELECT * FROM tenants ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+        rows.iter()
+            .map(crate::tenant_scoped::row_to_tenant)
+            .collect()
+    }
+
     async fn validate_token(&self, token: &str) -> BackendResult<Option<ApiToken>> {
         use sha2::{Digest, Sha256};
 
@@ -2022,7 +2085,7 @@ impl StateBackend for SqliteBackend {
         let now = Utc::now().to_rfc3339();
 
         let row = sqlx::query(
-            r#"SELECT id, name, role, created_at, expires_at
+            r#"SELECT id, name, role, created_at, expires_at, tenant_id
                FROM api_tokens
                WHERE token_hash = ?
                  AND revoked_at IS NULL
@@ -2046,9 +2109,9 @@ impl StateBackend for SqliteBackend {
             .map_err(map_db_err)?;
 
         let expires_at: Option<String> = row.get("expires_at");
-        let tenant_id: String = row
-            .try_get("tenant_id")
-            .unwrap_or_else(|_| crate::tenant::DEFAULT_TENANT.to_string());
+        // The token's own tenant. Not defaulted on a read error: a token
+        // silently moved into `default` would act on that tenant's data.
+        let tenant_id: String = row.try_get("tenant_id").map_err(map_db_err)?;
         let info = ApiToken {
             id,
             name: row.get("name"),
@@ -2778,6 +2841,7 @@ mod tests {
                 workflow_id: "test-wf".to_string(),
                 workflow_version: "1.0.0".to_string(),
                 initial_input: json!({"x": 1}),
+                initiated_by: None,
             },
         );
         db.append_event(event).await.unwrap();

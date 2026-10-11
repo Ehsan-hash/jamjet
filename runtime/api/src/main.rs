@@ -3,7 +3,7 @@ use jamjet_api::{config::ApiConfig, routes::build_router_with_opts, state::AppSt
 use jamjet_audit::{AuditEnricher, NoopAuditBackend, SqliteAuditBackend};
 use jamjet_state::{InMemoryBackend, SqliteBackend};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Parse a `JAMJET_STORE_TERM` value: a non-negative integer (the promotion
 /// generation). A present-but-invalid value is an error, not a silent no-op.
@@ -62,6 +62,12 @@ async fn main() -> anyhow::Result<()> {
         "Starting JamJet runtime"
     );
 
+    // Read once here, never per request from deep code.
+    let approval_policy = jamjet_api::approvals::ApprovalPolicy::from_env();
+    if approval_policy.allow_self_approval {
+        warn!("JAMJET_ALLOW_SELF_APPROVAL is set: the principal that starts a run may approve it");
+    }
+
     let state = if storage_backend == "memory" {
         info!("Using in-memory storage (ephemeral, no persistence)");
 
@@ -87,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
             enricher,
             protocols: jamjet_api::state::default_protocol_registry(),
             cron_store: None,
+            approval_policy,
         }
     } else {
         // Determine database URL: env > config > SQLite dev default
@@ -151,8 +158,18 @@ async fn main() -> anyhow::Result<()> {
             enricher,
             protocols: jamjet_api::state::default_protocol_registry(),
             cron_store: Some(Arc::new(jamjet_timers::CronStore::new(sqlite.pool()))),
+            approval_policy,
         }
     };
+
+    // Tokens of any tenant but `default` are refused: the engine is
+    // single-tenant. The opt-out is read here, once, and logged.
+    if jamjet_api::auth::tenant_tokens_as_default() {
+        tracing::warn!(
+            "{}=1: tokens of other tenants act in tenant default. This gives no isolation.",
+            jamjet_api::auth::TENANT_TOKENS_AS_DEFAULT_ENV
+        );
+    }
 
     // Spawn the scheduler as a background task — auto-chains nodes after completion.
     let scheduler = jamjet_scheduler::Scheduler::new(state.backend.clone());
@@ -199,17 +216,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // In dev mode (or when JAMJET_EMBED_CRON is set), run the cron scheduler in
-    // process so YAML-declared schedules fire. It POSTs to this server's own
-    // /executions endpoint. Production should run a dedicated cron process.
+    // process so YAML-declared schedules fire. It starts each run in-process,
+    // in the job's tenant, with the job's creator as initiator. This is the
+    // supported way to run cron, in production too: there is no separate cron
+    // process, because one would need its own token and would become the
+    // initiator of every run it starts.
     if (config.dev_mode || std::env::var("JAMJET_EMBED_CRON").is_ok())
         && storage_backend != "memory"
     {
-        let host = if config.bind == "0.0.0.0" {
-            "127.0.0.1".to_string()
-        } else {
-            config.bind.clone()
-        };
-        let self_url = format!("http://{}:{}", host, config.port);
         let database_url = std::env::var("DATABASE_URL")
             .ok()
             .or_else(|| config.database_url.clone())
@@ -223,9 +237,12 @@ async fn main() -> anyhow::Result<()> {
             });
         match jamjet_state::SqliteBackend::open(&database_url).await {
             Ok(b) => {
-                let cron = jamjet_timers::CronScheduler::new(b.pool(), self_url);
+                let launcher = std::sync::Arc::new(jamjet_api::cron::InProcessCronLauncher::new(
+                    state.clone(),
+                ));
+                let cron = jamjet_timers::CronScheduler::with_launcher(b.pool(), launcher);
                 tokio::spawn(cron.run());
-                info!("Cron scheduler started (dev mode)");
+                info!("Cron scheduler started (in-process launcher)");
             }
             Err(e) => tracing::warn!(error = %e, "cron scheduler: failed to open pool; skipping"),
         }

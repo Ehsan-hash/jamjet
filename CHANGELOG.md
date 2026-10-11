@@ -11,6 +11,204 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **Approvals are bound to the approver, the run's initiator and the exact action.**
+  Behaviour changes to plan for when upgrading:
+  - The MCP bridge requires a Bearer token outside dev mode, for every method.
+  - The recorded approver is the API token (`token:<id>`), never a body `user_id`.
+    `reviewer` tokens may now approve.
+  - The token that started a run cannot approve it (403). A run with no recorded
+    initiator (started in dev mode, or before this release) cannot be approved
+    outside dev mode. `JAMJET_ALLOW_SELF_APPROVAL=1` turns both checks off.
+    Separation of duties distinguishes tokens, not people: issue one token per human.
+  - An approval covers one action: run, node occurrence, node definition and the
+    payload the node is dispatched with (its `input`, for function nodes). If any of
+    those change, the node asks again. The payload, not the run's materialized
+    state: the two disagree on nested objects, so binding the state showed the
+    reviewer one input while the node ran on another. Outside dev mode an `approved`
+    decision must echo the pending request's `action_digest` (or `calls_hash` for an
+    agent tool dispatch): missing is 400, stale is 409. The pending listing shows the
+    payload and node the digest covers (`action_basis.payload`).
+  - An agent tool dispatch approval binds the run, the occurrence and the node
+    definition as well as the tool calls: its request carries an `action_digest`
+    built by the same function as every other node's. A dispatch node that
+    completed and is dispatched again with the same calls asks again instead of
+    firing on the first approval. A dispatch approval from before this release
+    (bound to `calls_hash` only) authorises nothing by itself; the node asks again.
+  - The ADK dispatcher no longer takes the code it runs from run state. It used to
+    import whatever `module:function` the run's `tools` map named for a call and
+    follow any attribute path, and the run's state is the initiator's to seed, so
+    a call named `lookup` could run a blocked `send_wire` (directly, through
+    `send_wire.__call__`, or through a re-export). `jamjet.agents.tool_runtime` now
+    accepts a `tools` entry only when it names a `@tool` registered under the
+    called name and is exactly that tool's own `module:qualname` (what the SDK
+    compiler writes); anything else is refused and nothing runs. An entry may
+    still select a same-named `@tool` from another importable module, but never
+    code the engine did not see: the engine matches the call on that handler and
+    binds it into the approval. A call with no entry resolves through the `@tool`
+    registry by name. Checking an entry may import its module (running its
+    top-level code); a refused entry leaves the registry as it found it.
+  - The engine also matches each call on the handler its `tools` entry names (as
+    written and in dotted form) and on that function's own name, binds the handler
+    into a per-call approval, and blocks the batch when an entry is not a
+    `module:function` string, has a function-path segment starting with `_`
+    (`send_wire.__call__`), or a module segment starting with `__`. This is
+    defence in depth: a pattern still binds a name, not code, and only a catch-all
+    binds an author who writes their own IR.
+  - Behaviour changes for ADK users:
+    - SDK-started runs carry the compiler's `tools` map, so their calls are now also
+      matched on handler and function name (`blocked_tools: ["delete"]` blocks a
+      tool `archive` whose function is `delete`; `payments.*` catches tools defined
+      in `payments.tools`).
+    - A `tools` entry must name a `@tool`. A plain function in the map, or a path to
+      a tool under another name (a re-export, an alias, an attribute such as
+      `.__call__`), is refused.
+    - A stale entry is refused rather than silently replaced by the registry: after a
+      tool module is renamed, recompile the agent so its map matches.
+    - A tool whose function name starts with `_` is refused by the engine when the
+      map names it; rename it.
+    - A tool defined in `__main__` is refused; define tools in an importable module,
+      as the examples do.
+    - Tools defined inside a function (a factory or closure) and `@staticmethod`
+      over `@tool` resolve when the tool is registered in the worker (the factory
+      has run, or the class's module has been imported); otherwise their entry
+      cannot be walked and is refused.
+  - A decision carrying a `state_patch` is refused with 400. The edit never reached
+    the executed action, so recording it was a false record.
+  - The worker protocol evaluates the same policy and approval rules as the
+    in-process worker, for every node kind: a gated or blocked node is withheld from
+    `POST /work-items/claim`, and `POST /work-items/:id/complete` refuses a result
+    for a gated node with no approval for its current occurrence. `POST /work-items`
+    is operator-only.
+  - The tenant routes are operator-only, reads included, and an operator can read or
+    change only the tenant of their own token. Before this, any developer could
+    `PUT /tenants/:id` and drop a tenant-level approval gate. The route/role table
+    is in docs/guides/security.md.
+  - Neither a run's initial input nor a worker's reported `state_patch` can write
+    the engine's bookkeeping key `__budget`; `start_run` (REST, MCP and cron) and
+    `POST /work-items/:id/complete` drop it. It was a way to reset a
+    run's budget and to change later nodes' input outside any approval.
+  - `agent_tool_dispatch: true` is refused at `POST /workflows` on any node that is
+    not the ADK dispatcher (`jamjet.agents.tool_runtime:dispatch_tool_calls`), and on
+    every `java_fn`. The flag used to send a node's policy straight to the per-call
+    guard, so an author could flag an ordinary function, present no tool calls, and
+    pass a tenant `["*"]` gate. Every node's own names are now checked first,
+    dispatch nodes included; a dispatcher matched by a gate is held with an approval
+    of its full payload even when it has no calls, and that approval covers its calls.
+  - A tenant policy is parsed strictly. `PUT /tenants/:id` refuses a policy that is
+    not an object of `blocked_tools`, `require_approval_for` and `model_allowlist`
+    with the right types (400), so a misspelt field can no longer be dropped. A
+    stored policy that does not parse (written by an older build or by hand) now
+    blocks every node of the tenant with a rule naming the fix, on the claim route
+    and in-process alike, where it used to read as no tenant policy at all.
+    To fix one, `PUT /tenants/:id` with a corrected policy, or `{"policy": {}}` to
+    clear it; a `null` or missing policy keeps the stored one.
+  - Tenant policy now applies to nodes the embedded workers run on SQLite. The base
+    SQLite backend, which the scheduler and the embedded pool use, could not read a
+    tenant record, so a tenant's `blocked_tools`, `require_approval_for` and
+    `model_allowlist` never applied to in-process kinds (`tool`, `mcp_tool`,
+    `a2a_task`, `model`, `agent`), while the claim route applied them. Behaviour
+    changes for a SQLite deployment with embedded workers and a policy on its
+    `default` tenant row:
+    - `model_allowlist` now applies to in-process model nodes, so a model outside it
+      fails the node (and the run);
+    - `require_approval_for: ["*"]` now holds every in-process `tool`, `mcp_tool`,
+      `a2a_task` and `agent` node; runs started by a cron job with no recorded
+      creator have no initiator, so those holds can never be approved outside dev
+      mode;
+    - a `default` row whose policy (or timestamp) cannot be read now refuses every
+      node: a policy that does not parse blocks it (see above), and a row the
+      backend cannot read at all leaves every node unavailable to retry until the
+      row is fixed.
+  - A node blocked by policy fails its run. Both transports settle the item and
+    record `NodeFailed { retryable: false }` in one fenced commit, so the scheduler
+    fails the run on its next tick. Before, a block on `POST /work-items/claim` left
+    the run `Running` forever, and the in-process worker retried the blocked node
+    until its attempts ran out, recording a violation each time. A node whose IR the
+    engine cannot evaluate is failed the same way.
+  - `python_fn`, `java_fn` and `external_fn` nodes can now be gated and blocked.
+    Their policy names are the handler reference (`module:function`,
+    `class/method`, `queue/handler`) and the node id. Before, these kinds had no
+    name, so no pattern matched them. Behaviour change: an existing policy whose
+    pattern matches one of these names, `["*"]` in particular, now gates or blocks
+    these nodes where it used to let them through. The node id counts as a name,
+    so a `blocked_tools` pattern written for tools can now hit a function node:
+    `blocked_tools: ["delete_*"]` blocks a `python_fn` node with id
+    `delete_temp_files`. Because a blocked node now fails its run (see below), such
+    a run fails where it used to complete. Check `blocked_tools` patterns against
+    your function node ids before upgrading. Python and Java handlers also
+    match in canonical dotted form, so `payments.transfer:send` and
+    `payments:transfer.send` are one name. This also widens existing patterns,
+    toward refusing: the module/function boundary disappears, so
+    `blocked_tools: ["db:drop*"]` now also blocks `db.dropdown:load`, and
+    `myapp.payments:*` covers every submodule (`myapp.payments.audit:log`). Since a
+    block fails the run, review handler patterns before upgrading. A pattern still
+    binds a name, not code: a
+    re-export reaches the same function under another path, so only a catch-all
+    binds an author who writes their own IR.
+  - `mcp_tool` nodes are now matched on their tool. The policy engine read a
+    `tool_name` field the kind does not have, so no `blocked_tools` or
+    `require_approval_for` pattern ever applied to an `mcp_tool` node. Behaviour
+    change: an existing pattern that names an MCP tool now gates or blocks it.
+  - Node ids must be 1 to 128 ASCII letters, digits, `_`, `.` or `-`, and a node's `id`
+    must equal its key in `nodes`; `POST /workflows` refuses anything else (400). Node ids are author-chosen and are printed into the
+    approve command a reviewer pastes. Behaviour change for IR with other ids; every
+    id the SDK compilers generate, and every example in this repo, already conforms.
+  - A registered workflow version is immutable: an identical re-register is a 200
+    no-op, a different IR under the same version is a 409. Identity is the
+    canonical content hash, so key order and whitespace do not matter.
+    For anything that re-registers its workflows at boot (PAS does): an edited
+    graph under an unchanged version now fails boot with 409, where before the
+    new IR silently replaced the old one. The first boot after upgrading also
+    fails if the database already holds a copy of an unchanged version that
+    differs from what the code now builds (a past edit made without a version
+    bump). Remedy: bump the workflow's version, which is the supported fix and
+    keeps runs of the old version readable; or, if no run of that version still
+    needs its old definition, delete the stale row
+    (`DELETE FROM workflow_definitions WHERE tenant_id = ? AND workflow_id = ? AND version = ?`;
+    PAS runs in the `default` tenant)
+    and boot again.
+  - The embedded cron scheduler starts runs in-process instead of POSTing to
+    `/executions` without a token, which failed with 401 outside dev mode. A cron
+    job records the token that created it (`created_by`, migration 0013), and its
+    runs take that token as initiator, so the creator cannot approve them. Jobs
+    created before this upgrade have no creator; their runs cannot be approved
+    outside dev mode until the job is recreated.
+  - `jamjet-timers` public API changes (a breaking release for that crate, so the
+    next crates.io publish needs a major-compatible bump, 0.5 to 0.6):
+    `CronStore::delete` now takes `(tenant_id, name)` and `CronStore::disable` takes
+    the job id; `CronStore::list_for_tenant` is new; `CronJob` gains `created_by`
+    and `tenant_id`; `HttpCronLauncher` and `CronScheduler::new` are removed.
+  - The unused HTTP cron launcher (`HttpCronLauncher`, `CronScheduler::new`) is
+    removed. It POSTed `/executions` with no token, so it failed outside dev mode,
+    and giving it a token would have made that service the initiator of every cron
+    run. Cron runs through the server's embedded scheduler.
+  - Cron jobs belong to a tenant. `POST`, `GET` and `DELETE /cron` act on the
+    caller's tenant only, a job name is unique per tenant (migration 0013 rebuilds
+    `cron_jobs` with `UNIQUE (tenant_id, name)`), and a job's runs start in its own
+    tenant. Before, jobs were global: any tenant could list them with their input,
+    and replace or delete one by name, and every run started in `default`.
+  - The runtime is single-tenant, and now says so. On SQLite token validation
+    never read a token's tenant and put every token in `default`; it now reads
+    it, and a token of any other tenant is refused with 403 ("multi-tenant
+    tokens are not supported by this runtime yet"), on REST and MCP. The API
+    layer is tenant-scoped but the engine under it is not, so such a token could
+    register a workflow version that the default tenant's runs were scheduled
+    from, and its own runs lost their tenant and tenant policy after the start
+    node. `JAMJET_TENANT_TOKENS_AS_DEFAULT=1` (read once at startup) restores the
+    old behaviour, where such a token acts in `default`; it gives no isolation.
+    Upgrade note: a deployment that inserted non-default tokens by hand gets 403
+    for them until it sets that variable or moves the tokens to `default`.
+    The embedded cron launcher follows the same rule: a job in any other tenant
+    starts no run (a warning is logged at each due time), unless the opt-out is
+    set, in which case it runs in `default`.
+
+- **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
+  request's digest, what it covers and the exact approve command (`--show-basis` prints
+  the bound payload). The command is printed alone on its line with every argument
+  shell-quoted, and is omitted for a value holding control characters, so it is safe to
+  paste. The Java SDK's `approve` overload that takes an action digest is listed under
+  the Java SDK changes below.
+
 - **The tool-effect idempotency key is derived by the engine, not taken from the request
   body** (#130). `POST /work-items/:id/complete` persisted the caller's
   `idempotency_key` verbatim, so a worker holding item B's lease could complete B while

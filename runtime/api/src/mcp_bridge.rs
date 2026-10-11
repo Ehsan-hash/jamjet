@@ -3,14 +3,15 @@
 //! This lets MCP clients (Claude Code, Cursor, etc.) interact with the
 //! JamJet runtime directly: run workflows, inspect executions, manage agents.
 
+use crate::auth::Role;
 use crate::state::AppState;
 use axum::Router;
-use chrono::Utc;
+
 use jamjet_agents::{AgentFilter, AgentStatus};
-use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use jamjet_mcp::server::McpServer;
+use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
+use jamjet_mcp::server::{McpServer, ToolCallContext};
 use jamjet_mcp::types::{McpContent, McpTool};
-use jamjet_state::{Event, EventKind, TenantId, WorkItem};
+use jamjet_state::{ApiToken, Event, EventKind, TenantId};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -18,15 +19,24 @@ use uuid::Uuid;
 /// Build the MCP bridge router with all JamJet runtime tools.
 ///
 /// The returned router is meant to be merged into the main API router.
-/// No auth layer — same security model as `jamjet dev` (local-only).
-pub fn build_mcp_bridge(state: AppState) -> Router {
+///
+/// Outside dev mode the caller mounts it behind `require_auth`, and every tool
+/// resolves its caller from the authenticated [`ApiToken`] in the request
+/// extensions: the tenant is the token's tenant, a `tenant_id` argument that
+/// disagrees with it is refused, and each tool checks the token's role. A
+/// missing token outside dev mode is refused rather than treated as anonymous,
+/// so mounting the bridge without the auth layer fails closed.
+///
+/// In dev mode (`jamjet dev`, local-only) no token exists: the tenant comes from
+/// the `tenant_id` argument (default `"default"`) as before.
+pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
     let st = Arc::new(state);
 
     let server = McpServer::new("jamjet-runtime", env!("CARGO_PKG_VERSION"), 0);
 
     // ── jamjet_run_workflow ──────────────────────────────────────────────
     let s = st.clone();
-    let server = server.register_tool(
+    let server = server.register_tool_with_context(
         McpTool {
             name: "jamjet_run_workflow".into(),
             description: Some(concat!(
@@ -38,7 +48,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                 "jamjet_get_execution, jamjet_get_events, jamjet_cancel_execution, or jamjet_approve. ",
                 "This operation is not reversible — use jamjet_cancel_execution to stop a running workflow. ",
                 "Fails if the workflow_id + version combination is not registered. ",
-                "No authentication required (local-only server)."
+                "Outside dev mode the bridge requires a Bearer API token with the developer or operator role."
             ).into()),
             input_schema: json!({
                 "type": "object",
@@ -57,85 +67,40 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     },
                     "tenant_id": {
                         "type": "string",
-                        "description": "Tenant partition for multi-tenant isolation. Defaults to 'default'. Execution and events are scoped to this tenant."
+                        "description": "Tenant partition for multi-tenant isolation. Outside dev mode the tenant is the API token's tenant and a different value is refused. In dev mode defaults to 'default'."
                     }
                 },
                 "required": ["workflow_id", "input"]
             }),
         },
-        move |args: Value| {
+        move |args: Value, ctx: ToolCallContext| {
             let s = s.clone();
             async move {
                 let workflow_id = args.get("workflow_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let input = args.get("input").cloned().unwrap_or(json!({}));
                 let version = args.get("workflow_version").and_then(|v| v.as_str()).unwrap_or("1.0.0").to_string();
-                let tenant_id = TenantId::from(
-                    args.get("tenant_id").and_then(|v| v.as_str()).unwrap_or("default"),
-                );
+                let caller = resolve_caller(&ctx, &args, dev_mode, Role::Developer)?;
+                let tenant_id = caller.tenant.clone();
 
-                let backend = s.backend_for(&tenant_id);
-
-                let def = backend
-                    .get_workflow(&workflow_id, &version)
-                    .await
-                    .map_err(|e| format!("failed to get workflow: {e}"))?
-                    .ok_or_else(|| format!("workflow {} v{} not found", workflow_id, version))?;
-
-                let start_node = def.ir.get("start_node")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("start")
-                    .to_string();
-
-                let now = Utc::now();
-                let execution = WorkflowExecution {
-                    execution_id: ExecutionId::new(),
-                    workflow_id: workflow_id.clone(),
-                    workflow_version: version.clone(),
-                    status: WorkflowStatus::Running,
-                    initial_input: input.clone(),
-                    current_state: input.clone(),
-                    started_at: now,
-                    updated_at: now,
-                    completed_at: None,
-                    session_type: None,
-                    parent_execution_id: None,
-                    segment_number: 0,
-                };
-                let eid = execution.execution_id.clone();
-                backend.create_execution(execution).await.map_err(|e| format!("{e}"))?;
-
-                let event = Event::new(eid.clone(), 1, EventKind::WorkflowStarted {
-                    workflow_id: workflow_id.clone(),
-                    workflow_version: version.clone(),
-                    initial_input: input.clone(),
-                });
-                backend.append_event(event).await.map_err(|e| format!("{e}"))?;
-
-                let queue_type = "general".to_string();
-                let sched_event = Event::new(eid.clone(), 2, EventKind::NodeScheduled {
-                    node_id: start_node.clone(),
-                    queue_type: queue_type.clone(),
-                });
-                backend.append_event(sched_event).await.map_err(|e| format!("{e}"))?;
-
-                let work_item = WorkItem {
-                    id: Uuid::new_v4(),
-                    execution_id: eid.clone(),
-                    node_id: start_node,
-                    queue_type,
-                    payload: json!({"workflow_id": workflow_id, "workflow_version": version}),
-                    attempt: 0,
-                    max_attempts: 3,
-                    created_at: now,
-                    lease_expires_at: None,
-                    worker_id: None,
-                    lease_fence: 0,
-                    tenant_id: tenant_id.0.clone(),
-                };
-                backend.enqueue_work_item(work_item).await.map_err(|e| format!("{e}"))?;
+                // The same start path as `POST /executions`: one execution
+                // record, `WorkflowStarted` with this token as initiator, and
+                // the start item built and routed by the scheduler's own payload
+                // builder. A second copy here once enqueued a bare payload on
+                // `general` whatever the start node's kind.
+                let initiated_by = caller.token.as_ref().map(crate::auth::principal_of);
+                let (_, axum::Json(started)) = crate::routes::start_run(
+                    &s,
+                    &tenant_id,
+                    workflow_id,
+                    Some(version),
+                    input,
+                    initiated_by,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
 
                 Ok(vec![McpContent::Text {
-                    text: json!({"execution_id": eid.to_string()}).to_string(),
+                    text: json!({"execution_id": started["execution_id"]}).to_string(),
                 }])
             }
         },
@@ -143,7 +108,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
 
     // ── jamjet_get_execution ─────────────────────────────────────────────
     let s = st.clone();
-    let server = server.register_tool(
+    let server = server.register_tool_with_context(
         McpTool {
             name: "jamjet_get_execution".into(),
             description: Some(concat!(
@@ -163,19 +128,18 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     },
                     "tenant_id": {
                         "type": "string",
-                        "description": "Tenant partition to query. Defaults to 'default'. Must match the tenant used when the execution was created."
+                        "description": "Tenant partition to query. Defaults to 'default'. Must match the tenant used when the execution was created. Outside dev mode the tenant is the API token's tenant and a different value is refused."
                     }
                 },
                 "required": ["execution_id"]
             }),
         },
-        move |args: Value| {
+        move |args: Value, ctx: ToolCallContext| {
             let s = s.clone();
             async move {
                 let id_str = args.get("execution_id").and_then(|v| v.as_str()).unwrap_or("");
-                let tenant_id = TenantId::from(
-                    args.get("tenant_id").and_then(|v| v.as_str()).unwrap_or("default"),
-                );
+                let caller = resolve_caller(&ctx, &args, dev_mode, Role::Viewer)?;
+                let tenant_id = caller.tenant.clone();
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
                 let exec = backend.get_execution(&eid).await.map_err(|e| format!("{e}"))?
@@ -188,7 +152,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
 
     // ── jamjet_list_executions ───────────────────────────────────────────
     let s = st.clone();
-    let server = server.register_tool(
+    let server = server.register_tool_with_context(
         McpTool {
             name: "jamjet_list_executions".into(),
             description: Some(concat!(
@@ -217,17 +181,16 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     },
                     "tenant_id": {
                         "type": "string",
-                        "description": "Tenant partition to query. Defaults to 'default'. Only executions in this tenant are returned."
+                        "description": "Tenant partition to query. Defaults to 'default'. Only executions in this tenant are returned. Outside dev mode the tenant is the API token's tenant and a different value is refused."
                     }
                 }
             }),
         },
-        move |args: Value| {
+        move |args: Value, ctx: ToolCallContext| {
             let s = s.clone();
             async move {
-                let tenant_id = TenantId::from(
-                    args.get("tenant_id").and_then(|v| v.as_str()).unwrap_or("default"),
-                );
+                let caller = resolve_caller(&ctx, &args, dev_mode, Role::Viewer)?;
+                let tenant_id = caller.tenant.clone();
                 let status = args.get("status").and_then(|v| v.as_str()).and_then(parse_status);
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
                 let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -242,7 +205,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
 
     // ── jamjet_cancel_execution ──────────────────────────────────────────
     let s = st.clone();
-    let server = server.register_tool(
+    let server = server.register_tool_with_context(
         McpTool {
             name: "jamjet_cancel_execution".into(),
             description: Some(concat!(
@@ -262,24 +225,21 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     },
                     "tenant_id": {
                         "type": "string",
-                        "description": "Tenant partition. Defaults to 'default'. Must match the tenant used when the execution was created."
+                        "description": "Tenant partition. Defaults to 'default'. Must match the tenant used when the execution was created. Outside dev mode the tenant is the API token's tenant and a different value is refused."
                     }
                 },
                 "required": ["execution_id"]
             }),
         },
-        move |args: Value| {
+        move |args: Value, ctx: ToolCallContext| {
             let s = s.clone();
             async move {
                 let id_str = args
                     .get("execution_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let tenant_id = TenantId::from(
-                    args.get("tenant_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("default"),
-                );
+                let caller = resolve_caller(&ctx, &args, dev_mode, Role::Developer)?;
+                let tenant_id = caller.tenant.clone();
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
 
@@ -324,7 +284,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
 
     // ── jamjet_get_events ────────────────────────────────────────────────
     let s = st.clone();
-    let server = server.register_tool(
+    let server = server.register_tool_with_context(
         McpTool {
             name: "jamjet_get_events".into(),
             description: Some(concat!(
@@ -345,24 +305,21 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     },
                     "tenant_id": {
                         "type": "string",
-                        "description": "Tenant partition to query. Defaults to 'default'. Must match the tenant used when the execution was created."
+                        "description": "Tenant partition to query. Defaults to 'default'. Must match the tenant used when the execution was created. Outside dev mode the tenant is the API token's tenant and a different value is refused."
                     }
                 },
                 "required": ["execution_id"]
             }),
         },
-        move |args: Value| {
+        move |args: Value, ctx: ToolCallContext| {
             let s = s.clone();
             async move {
                 let id_str = args
                     .get("execution_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let tenant_id = TenantId::from(
-                    args.get("tenant_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("default"),
-                );
+                let caller = resolve_caller(&ctx, &args, dev_mode, Role::Viewer)?;
+                let tenant_id = caller.tenant.clone();
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
                 let events = backend.get_events(&eid).await.map_err(|e| format!("{e}"))?;
@@ -375,13 +332,13 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
 
     // ── jamjet_approve ───────────────────────────────────────────────────
     let s = st.clone();
-    let server = server.register_tool(
+    let server = server.register_tool_with_context(
         McpTool {
             name: "jamjet_approve".into(),
             description: Some(concat!(
                 "Submit an approval or rejection decision for a workflow execution that is paused and waiting for human review. ",
                 "Use this when jamjet_list_executions shows a 'paused' execution or jamjet_get_events shows an ApprovalRequested event. ",
-                "Side effects: appends an ApprovalReceived event to the event log (with user_id 'mcp-client') and, if the execution is paused, ",
+                "Side effects: appends an ApprovalReceived event to the event log, recording the authenticated API token as the approver ('mcp-client' only in dev mode), and, if the execution is paused, ",
                 "resumes it to 'running' status so the next node can proceed. The decision is recorded in the immutable audit trail. ",
                 "Returns a JSON object with execution_id and accepted: true. ",
                 "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', or if nothing is pending approval (or node_id does not match a pending approval). ",
@@ -407,15 +364,19 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                         "type": "string",
                         "description": "Optional free-text comment explaining the decision. Recorded in the audit trail alongside the approval event."
                     },
+                    "action_digest": {
+                        "type": "string",
+                        "description": "The action_digest (or, for an agent tool dispatch, the calls_hash) from the context of the pending approval you reviewed. Required to approve outside dev mode. If the pending request has been superseded the decision is refused, so you never approve an action you did not see."
+                    },
                     "tenant_id": {
                         "type": "string",
-                        "description": "Tenant partition. Defaults to 'default'. Must match the tenant used when the execution was created."
+                        "description": "Tenant partition. Defaults to 'default'. Must match the tenant used when the execution was created. Outside dev mode the tenant is the API token's tenant and a different value is refused."
                     }
                 },
                 "required": ["execution_id", "decision"]
             }),
         },
-        move |args: Value| {
+        move |args: Value, ctx: ToolCallContext| {
             let s = s.clone();
             async move {
                 let id_str = args
@@ -432,11 +393,18 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     .get("comment")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let tenant_id = TenantId::from(
-                    args.get("tenant_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("default"),
-                );
+                let action_digest = match args.get("action_digest") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(d)) => Some(d.clone()),
+                    Some(_) => return Err("action_digest must be a string".into()),
+                };
+                // Forwarded so the shared submission refuses it exactly as the
+                // REST route does; silently dropping it would let a client
+                // believe its edit was recorded.
+                let state_patch = args.get("state_patch").cloned();
+                // Reviewer and above may decide, matching the REST route.
+                let caller = resolve_caller(&ctx, &args, dev_mode, Role::Reviewer)?;
+                let tenant_id = caller.tenant.clone();
 
                 let decision = match decision_str {
                     "approved" => jamjet_state::event::ApprovalDecision::Approved,
@@ -447,6 +415,14 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
 
+                // The approver is the authenticated token, never a
+                // client-chosen string. Dev mode has no token.
+                let (user_id, principal) = match &caller.token {
+                    Some(t) => (t.name.clone(), Some(crate::auth::principal_of(t))),
+                    None => ("mcp-client".to_string(), None),
+                };
+                let actor_id = principal.clone().unwrap_or_else(|| user_id.clone());
+
                 let (resolved_node, event) = crate::approvals::submit_approval(
                     &backend,
                     &eid,
@@ -456,11 +432,15 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                         } else {
                             Some(node_id)
                         },
-                        user_id: "mcp-client".into(),
+                        user_id,
+                        principal,
                         decision,
                         comment,
-                        state_patch: None,
+                        state_patch,
+                        action_digest,
+                        dev_mode,
                     },
+                    s.approval_policy,
                 )
                 .await
                 .map_err(|e| e.to_string())?;
@@ -468,14 +448,15 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                 // Seal the approval into the signed, hash-chained audit log,
                 // mirroring the REST approve path: best-effort, after the
                 // durable event write, off the worker's fenced commit path.
-                let ctx = jamjet_audit::RequestContext {
+                let audit_ctx = jamjet_audit::RequestContext {
+                    actor_id,
                     actor_type: jamjet_audit::ActorType::Human,
                     tenant_id: tenant_id.0.clone(),
                     method: Some("POST".to_string()),
                     path: Some("/mcp/tools/jamjet_approve".to_string()),
                     ..Default::default()
                 };
-                s.enricher.enrich_and_append(&event, Some(&ctx)).await;
+                s.enricher.enrich_and_append(&event, Some(&audit_ctx)).await;
 
                 Ok(vec![McpContent::Text {
                     text: json!({"execution_id": id_str, "node_id": resolved_node, "accepted": true})
@@ -487,7 +468,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
 
     // ── jamjet_list_agents ───────────────────────────────────────────────
     let s = st.clone();
-    let server = server.register_tool(
+    let server = server.register_tool_with_context(
         McpTool {
             name: "jamjet_list_agents".into(),
             description: Some(concat!(
@@ -517,9 +498,10 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                 }
             }),
         },
-        move |args: Value| {
+        move |args: Value, ctx: ToolCallContext| {
             let s = s.clone();
             async move {
+                resolve_caller(&ctx, &args, dev_mode, Role::Viewer)?;
                 let status = args.get("status").and_then(|v| v.as_str()).and_then(|s| match s {
                     "registered" => Some(AgentStatus::Registered),
                     "active" => Some(AgentStatus::Active),
@@ -541,7 +523,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
 
     // ── jamjet_discover_agent ────────────────────────────────────────────
     let s = st.clone();
-    let server = server.register_tool(
+    let server = server.register_tool_with_context(
         McpTool {
             name: "jamjet_discover_agent".into(),
             description: Some(concat!(
@@ -564,9 +546,10 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                 "required": ["url"]
             }),
         },
-        move |args: Value| {
+        move |args: Value, ctx: ToolCallContext| {
             let s = s.clone();
             async move {
+                resolve_caller(&ctx, &args, dev_mode, Role::Developer)?;
                 let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 let agent = s.agents.discover_remote(url).await.map_err(|e| e.to_string())?;
                 let text = serde_json::to_string(&agent).map_err(|e| format!("{e}"))?;
@@ -579,6 +562,65 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Who is calling a bridge tool, resolved from the transport.
+struct Caller {
+    tenant: TenantId,
+    /// The authenticated token. `None` only in dev mode.
+    token: Option<ApiToken>,
+}
+
+/// Resolve and authorise the caller of a bridge tool.
+///
+/// Outside dev mode the identity is the [`ApiToken`] that `require_auth` put in
+/// the request extensions. Every branch that cannot establish it refuses:
+/// no token (the auth layer is missing or was bypassed), a role below `need`,
+/// a `tenant_id` argument that is not a string, or one that names a tenant
+/// other than the token's. The argument is only ever allowed to agree.
+fn resolve_caller(
+    ctx: &ToolCallContext,
+    args: &Value,
+    dev_mode: bool,
+    need: Role,
+) -> Result<Caller, String> {
+    let arg_tenant = match args.get("tenant_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(_) => return Err("tenant_id must be a string".into()),
+    };
+
+    if dev_mode {
+        return Ok(Caller {
+            tenant: TenantId::from(arg_tenant.unwrap_or("default")),
+            token: None,
+        });
+    }
+
+    let Some(token) = ctx.extensions.get::<ApiToken>().cloned() else {
+        return Err("unauthenticated: a Bearer API token is required".into());
+    };
+    // `require_auth` already refuses these; checked again so the bridge stays
+    // closed if it is ever mounted without that layer.
+    let token = crate::auth::admit_token(token, crate::auth::tenant_tokens_as_default())
+        .map_err(str::to_string)?;
+    if Role::parse_role(&token.role) < need {
+        return Err(format!(
+            "insufficient role '{}' for this tool; {:?} or above required",
+            token.role, need
+        ));
+    }
+    if let Some(t) = arg_tenant {
+        if t != token.tenant_id {
+            return Err(format!(
+                "tenant_id '{t}' does not match the API token's tenant"
+            ));
+        }
+    }
+    Ok(Caller {
+        tenant: TenantId::from(token.tenant_id.clone()),
+        token: Some(token),
+    })
+}
 
 fn parse_execution_id(s: &str) -> Result<ExecutionId, String> {
     let hex = s.strip_prefix("exec_").unwrap_or(s);

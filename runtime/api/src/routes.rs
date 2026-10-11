@@ -22,6 +22,7 @@ use chrono::Utc;
 use jamjet_agents::{AgentCard, AgentFilter, AgentStatus};
 use jamjet_audit::backend::AuditQuery;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+use jamjet_ir::workflow::NodeDef;
 use jamjet_state::{FailOutcome, Tenant, TenantId, TenantStatus, WorkItem, WorkflowDefinition};
 use jamjet_worker::DispatchGuardOutcome;
 use serde::Deserialize;
@@ -52,7 +53,7 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .route("/executions/:id", get(get_execution))
         .route("/executions/:id/cancel", post(cancel_execution))
         .route("/executions/:id/events", get(list_events))
-        .route("/executions/:id/approve", post(approve_execution))
+        .route(crate::auth::APPROVE_ROUTE, post(approve_execution))
         .route(
             "/executions/:id/approvals",
             get(list_approvals_for_execution),
@@ -73,16 +74,36 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .route("/agents/:id/deactivate", post(deactivate_agent))
         .route("/agents/:id/heartbeat", post(agent_heartbeat))
         // Work items (worker protocol)
-        .route("/work-items", post(enqueue_work_item))
+        // Operator-only outside dev mode: the engine is the only legitimate
+        // producer of work items, and a hand-enqueued item for a gated node was
+        // the first step of the worker-protocol bypass (review C1).
+        .route(
+            "/work-items",
+            if dev_mode {
+                post(enqueue_work_item)
+            } else {
+                post(enqueue_work_item)
+                    .layer(middleware::from_fn(crate::auth::require_operator_role))
+            },
+        )
         .route("/work-items/claim", post(claim_work_item))
         .route("/work-items/:id/complete", post(complete_work_item))
         .route("/work-items/:id/fail", post(fail_work_item))
         .route("/work-items/:id/heartbeat", post(heartbeat_work_item))
         // Admin
         .route("/workers", get(list_workers))
-        // Tenant management (operator-only)
-        .route("/tenants", post(create_tenant).get(list_tenants))
-        .route("/tenants/:id", get(get_tenant).put(update_tenant))
+        // Tenant management. Operator-only outside dev mode, reads included: the
+        // tenant policy is the one layer a developer cannot rewrite, so it is the
+        // only one that can bind the developer who starts a run (review C1). The
+        // handlers also confine an operator to the tenant of their token.
+        .route(
+            "/tenants",
+            operator_only(post(create_tenant).get(list_tenants), dev_mode),
+        )
+        .route(
+            "/tenants/:id",
+            operator_only(get(get_tenant).put(update_tenant), dev_mode),
+        )
         // Audit log — immutable, append-only
         .route("/audit", get(list_audit_log))
         // Coordinator decisions and agent search
@@ -108,12 +129,23 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
     } else {
         api_routes
             .layer(middleware::from_fn(require_write_role))
-            .layer(middleware::from_fn_with_state(auth_state, require_auth))
+            .layer(middleware::from_fn_with_state(
+                auth_state.clone(),
+                require_auth,
+            ))
             .with_state(state.clone())
     };
 
-    // MCP bridge — unauthenticated, local-only.
-    let mcp_bridge = crate::mcp_bridge::build_mcp_bridge(state.clone());
+    // MCP bridge. Outside dev mode it sits behind the same Bearer token check as
+    // the REST API; each tool then takes its tenant and role from that token
+    // (see `mcp_bridge::resolve_caller`). `route_layer`, not `layer`, so the
+    // check covers the bridge's own routes and nothing it is merged with.
+    let mcp_bridge = crate::mcp_bridge::build_mcp_bridge(state.clone(), dev_mode);
+    let mcp_bridge = if dev_mode {
+        mcp_bridge
+    } else {
+        mcp_bridge.route_layer(middleware::from_fn_with_state(auth_state, require_auth))
+    };
 
     // Public routes — no auth required.
     Router::new()
@@ -125,6 +157,20 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .fallback(crate::static_files::serve_spa)
 }
 
+/// Put `route` behind [`crate::auth::require_operator_role`] outside dev mode.
+/// The layer extracts the token, so a request that reaches it without one is
+/// refused rather than let through.
+fn operator_only(
+    route: axum::routing::MethodRouter<AppState>,
+    dev_mode: bool,
+) -> axum::routing::MethodRouter<AppState> {
+    if dev_mode {
+        route
+    } else {
+        route.layer(middleware::from_fn(crate::auth::require_operator_role))
+    }
+}
+
 // ── Dev-mode middleware ──────────────────────────────────────────────────────
 
 /// Injects a default tenant extension for dev mode (no auth required).
@@ -134,6 +180,7 @@ async fn inject_dev_tenant(
 ) -> axum::response::Response {
     req.extensions_mut()
         .insert(TenantId::from("default".to_string()));
+    req.extensions_mut().insert(crate::auth::DevMode);
     next.run(req).await
 }
 
@@ -197,8 +244,32 @@ async fn create_workflow(
     // cannot run them, or to none at all.
     jamjet_ir::validate_external_queues(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // Node ids are printed into commands a reviewer pastes into a shell.
+    jamjet_ir::validate_node_ids(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
+
+    // A registered version is IMMUTABLE. Overwriting it let a developer drop
+    // the approval gate from a live workflow (the worker loads IR per item) or
+    // swap a node's body under an approval that still matched
+    // (approval-integrity review, C2). Re-registering the same definition is
+    // an idempotent 200, because deployments re-register on every boot; a
+    // different definition is a 409. The backend refuses the overwrite too, so
+    // a race between this read and the write cannot slip one through.
+    if let Some(existing) = backend.get_workflow(&workflow_id, &version).await? {
+        if !jamjet_state::backend::same_definition(&existing.ir, &body.ir) {
+            return Err(ApiError::Conflict(format!(
+                "workflow {workflow_id} v{version} is already registered with a different \
+                 definition; versions are immutable, register a new version"
+            )));
+        }
+        return Ok((
+            StatusCode::OK,
+            Json(json!({ "workflow_id": workflow_id, "version": version })),
+        ));
+    }
+
     let def = WorkflowDefinition {
         workflow_id: workflow_id.clone(),
         version: version.clone(),
@@ -229,16 +300,52 @@ struct StartExecutionRequest {
 async fn start_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
+    token: Option<Extension<jamjet_state::ApiToken>>,
     Json(body): Json<StartExecutionRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let backend = state.backend_for(&tenant_id);
-    let version = body.workflow_version.unwrap_or_else(|| "1.0.0".into());
+    // Who started the run, for separation of duties at approval time. Only the
+    // authenticated token counts; dev mode has none.
+    let initiated_by = token
+        .as_ref()
+        .map(|Extension(t)| crate::auth::principal_of(t));
+    start_run(
+        &state,
+        &tenant_id,
+        body.workflow_id,
+        body.workflow_version,
+        body.input,
+        initiated_by,
+    )
+    .await
+}
+
+/// Start one run of `workflow_id`: the execution record, `WorkflowStarted`
+/// (with `initiated_by`) and the start node's work item. The ONE start path,
+/// shared by `POST /executions`, the MCP bridge's `jamjet_run_workflow` and the
+/// in-process cron launcher (whose runs take the job's creator as initiator),
+/// so the start item, its payload and the initiator cannot diverge by
+/// transport.
+pub async fn start_run(
+    state: &AppState,
+    tenant_id: &TenantId,
+    workflow_id: String,
+    workflow_version: Option<String>,
+    input: Value,
+    initiated_by: Option<String>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // The engine's bookkeeping keys (`__budget`) are not the caller's to set.
+    // The budget enforcer reads them back, and the approval digest leaves
+    // them out as engine-written, so a seeded value would be a budget the
+    // engine never recorded and input no approval covers.
+    let input = jamjet_state::approvals::action_state(&input);
+    let backend = state.backend_for(tenant_id);
+    let version = workflow_version.unwrap_or_else(|| "1.0.0".into());
 
     // Verify the workflow definition exists (within this tenant).
     let def = backend
-        .get_workflow(&body.workflow_id, &version)
+        .get_workflow(&workflow_id, &version)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("workflow {} v{}", body.workflow_id, version)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("workflow {} v{}", workflow_id, version)))?;
 
     // Determine the start node from the IR.
     let start_node = def
@@ -249,10 +356,9 @@ async fn start_execution(
         .to_string();
 
     let now = Utc::now();
-    let input = body.input;
     let execution = WorkflowExecution {
         execution_id: ExecutionId::new(),
-        workflow_id: body.workflow_id.clone(),
+        workflow_id: workflow_id.clone(),
         workflow_version: version.clone(),
         status: WorkflowStatus::Running,
         initial_input: input.clone(),
@@ -272,9 +378,10 @@ async fn start_execution(
         execution_id.clone(),
         1,
         jamjet_state::EventKind::WorkflowStarted {
-            workflow_id: body.workflow_id.clone(),
+            workflow_id: workflow_id.clone(),
             workflow_version: version.clone(),
             initial_input: input.clone(),
+            initiated_by,
         },
     );
     backend.append_event(event).await?;
@@ -286,13 +393,13 @@ async fn start_execution(
     let ir: jamjet_ir::WorkflowIr = serde_json::from_value(def.ir.clone()).map_err(|e| {
         ApiError::Internal(format!(
             "stored IR for workflow {} v{} is not loadable: {e}",
-            body.workflow_id, version
+            workflow_id, version
         ))
     })?;
     let start_def = ir.nodes.get(&start_node).ok_or_else(|| {
         ApiError::BadRequest(format!(
             "workflow {} v{} names start node '{}' which does not exist",
-            body.workflow_id, version, start_node
+            workflow_id, version, start_node
         ))
     })?;
     let queue_type = serde_json::to_value(start_def.kind.queue_type())
@@ -305,7 +412,7 @@ async fn start_execution(
         &start_node,
         start_def,
         &initial_state,
-        &body.workflow_id,
+        &workflow_id,
         &version,
     );
     let max_attempts = jamjet_scheduler::max_attempts_for(start_def.retry_policy.as_deref());
@@ -488,12 +595,31 @@ struct ApproveRequest {
     node_id: Option<String>,
     user_id: Option<String>,
     comment: Option<String>,
+    /// Refused with 400 when non-null: approval edits are not supported.
     state_patch: Option<Value>,
+    /// Echo of the pending request's `action_digest` (or `calls_hash` for an
+    /// agent tool dispatch), from `GET /executions/:id/approvals`. Required on
+    /// an `approved` decision outside dev mode (400 without it); a mismatch is
+    /// a 409: the decider was looking at a superseded request.
+    #[serde(default)]
+    action_digest: Option<String>,
 }
 
+/// `POST /executions/:id/approve` — record a decision on a pending approval.
+///
+/// IDENTITY. With auth on, the approver is the authenticated API token: the
+/// recorded `user_id` is the token's name and `principal` is `token:<id>`. The
+/// body's `user_id` is IGNORED in that mode, because a caller-chosen name on an
+/// approval is a forgery primitive. Only dev mode (the dev-mode router's
+/// `DevMode` marker, checked explicitly) records the body's `user_id`, with no
+/// principal. No token and no marker is refused with 401.
+///
+/// ROLE. `reviewer` and above may call this route; see `require_write_role`.
 async fn approve_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
+    token: Option<Extension<jamjet_state::ApiToken>>,
+    dev_mode: Option<Extension<crate::auth::DevMode>>,
     Path(id): Path<String>,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -506,23 +632,43 @@ async fn approve_execution(
         other => return Err(ApiError::BadRequest(format!("unknown decision: {other}"))),
     };
 
+    let (user_id, principal) = match (&token, &dev_mode) {
+        (Some(Extension(t)), _) => (t.name.clone(), Some(crate::auth::principal_of(t))),
+        // Only the dev-mode router records a caller-chosen name.
+        (None, Some(_)) => (body.user_id.unwrap_or_else(|| "anonymous".into()), None),
+        // No token and not dev mode: the auth layer is missing. Refuse rather
+        // than record an unauthenticated approval under the body's name.
+        (None, None) => return Err(ApiError::Unauthorized),
+    };
+    let actor_id = principal.clone().unwrap_or_else(|| user_id.clone());
+
     let (node_id, event) = crate::approvals::submit_approval(
         &backend,
         &execution_id,
         crate::approvals::ApprovalSubmission {
             node_id: body.node_id,
-            user_id: body.user_id.unwrap_or_else(|| "anonymous".into()),
+            user_id,
+            principal,
             decision,
             comment: body.comment,
             state_patch: body.state_patch,
+            action_digest: body.action_digest,
+            dev_mode: dev_mode.is_some(),
         },
+        state.approval_policy,
     )
     .await
     .map_err(|e| match e {
+        crate::approvals::SubmitError::SelfApproval
+        | crate::approvals::SubmitError::InitiatorUnknown
+        | crate::approvals::SubmitError::PrincipalMissing => ApiError::Forbidden(e.to_string()),
         crate::approvals::SubmitError::MultiplePending(_) => ApiError::BadRequest(e.to_string()),
         crate::approvals::SubmitError::NoPending
         | crate::approvals::SubmitError::NodeNotPending(_)
-        | crate::approvals::SubmitError::ExecutionTerminal(_) => ApiError::Conflict(e.to_string()),
+        | crate::approvals::SubmitError::ExecutionTerminal(_)
+        | crate::approvals::SubmitError::StaleDigest => ApiError::Conflict(e.to_string()),
+        crate::approvals::SubmitError::EditsUnsupported
+        | crate::approvals::SubmitError::DigestRequired => ApiError::BadRequest(e.to_string()),
         crate::approvals::SubmitError::Backend(msg) => ApiError::Internal(msg),
     })?;
 
@@ -535,6 +681,7 @@ async fn approve_execution(
     // routed through the enricher (that needs the enricher threaded into the
     // worker pool); tracked as F-t3-audit-emit.
     let ctx = jamjet_audit::RequestContext {
+        actor_id,
         actor_type: jamjet_audit::ActorType::Human,
         tenant_id: tenant_id.0.clone(),
         method: Some("POST".to_string()),
@@ -595,6 +742,13 @@ async fn list_approvals_for_execution(
                         "status":   "approved",
                         "user_id":  row.user_id,
                         "sequence": row.last_sequence,
+                        // Same field the event-log path reports.
+                        "approved_digest": row
+                            .context
+                            .as_ref()
+                            .and_then(|c| c.get("approved_digest"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
                     }));
                 }
                 "rejected" => {
@@ -969,6 +1123,28 @@ struct CreateTenantRequest {
     name: String,
 }
 
+/// The tenant an operator may administer: their token's tenant. Dev mode has
+/// no tokens and no tenants to protect, so it is unrestricted there. Outside
+/// dev mode a request with no token is refused, never treated as unscoped.
+fn tenant_in_scope(
+    target: &str,
+    caller: Option<&jamjet_state::ApiToken>,
+    dev: Option<&crate::auth::DevMode>,
+) -> Result<(), ApiError> {
+    if dev.is_some() {
+        return Ok(());
+    }
+    match caller {
+        Some(token) if token.tenant_id == target => Ok(()),
+        Some(_) => Err(ApiError::Forbidden(format!(
+            "tenant {target} is not the tenant of this token"
+        ))),
+        None => Err(ApiError::Forbidden(
+            "tenant administration needs an operator token".into(),
+        )),
+    }
+}
+
 async fn create_tenant(
     State(state): State<AppState>,
     Json(body): Json<CreateTenantRequest>,
@@ -989,16 +1165,38 @@ async fn create_tenant(
     Ok((StatusCode::CREATED, Json(json!({ "tenant_id": body.id }))))
 }
 
-async fn list_tenants(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn list_tenants(
+    State(state): State<AppState>,
+    caller: Option<Extension<jamjet_state::ApiToken>>,
+    dev: Option<Extension<crate::auth::DevMode>>,
+) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&TenantId::default());
     let tenants = backend.list_tenants().await?;
+    let tenants: Vec<Tenant> = tenants
+        .into_iter()
+        .filter(|t| {
+            tenant_in_scope(
+                t.id.as_str(),
+                caller.as_ref().map(|c| &c.0),
+                dev.as_ref().map(|d| &d.0),
+            )
+            .is_ok()
+        })
+        .collect();
     Ok(Json(json!({ "tenants": tenants })))
 }
 
 async fn get_tenant(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    caller: Option<Extension<jamjet_state::ApiToken>>,
+    dev: Option<Extension<crate::auth::DevMode>>,
 ) -> Result<Json<Value>, ApiError> {
+    tenant_in_scope(
+        &id,
+        caller.as_ref().map(|c| &c.0),
+        dev.as_ref().map(|d| &d.0),
+    )?;
     let backend = state.backend_for(&TenantId::default());
     let tenant = backend
         .get_tenant(&TenantId::from(id.as_str()))
@@ -1020,8 +1218,15 @@ struct UpdateTenantRequest {
 async fn update_tenant(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    caller: Option<Extension<jamjet_state::ApiToken>>,
+    dev: Option<Extension<crate::auth::DevMode>>,
     Json(body): Json<UpdateTenantRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    tenant_in_scope(
+        &id,
+        caller.as_ref().map(|c| &c.0),
+        dev.as_ref().map(|d| &d.0),
+    )?;
     let backend = state.backend_for(&TenantId::default());
     let tid = TenantId::from(id.as_str());
     let existing = backend
@@ -1034,6 +1239,17 @@ async fn update_tenant(
         .map(serde_json::from_value)
         .transpose()
         .map_err(|e| ApiError::BadRequest(format!("invalid limits: {e}")))?;
+    // The policy is parsed strictly before it is stored: a malformed one
+    // would otherwise refuse every node of the tenant at run time.
+    if let Some(policy) = &body.policy {
+        jamjet_state::tenant::parse_tenant_policy(policy).map_err(|e| {
+            ApiError::BadRequest(format!(
+                "invalid policy: {e}. Send an object with blocked_tools, \
+                     require_approval_for and model_allowlist; {{}} clears the policy, and a \
+                     null or missing policy keeps the stored one"
+            ))
+        })?;
+    }
 
     let updated = Tenant {
         id: tid.clone(),
@@ -1138,9 +1354,10 @@ async fn claim_work_item(
     };
 
     // Enforcement lives HERE, not only in the in-process worker: `python_tool`
-    // and `java_tool` are registered with zero in-process workers, so an ADK
-    // agent's tool-dispatch node reaches production down this route and never
-    // through `Worker::execute_item`. See `gate_claimed_item`.
+    // and `java_tool` are registered with zero in-process workers, and this
+    // route serves every queue name, the in-process ones included. So any node
+    // can reach a worker down this route without passing through
+    // `Worker::execute_item`. See `gate_claimed_item`.
     if matches!(
         gate_claimed_item(backend.as_ref(), &wi).await,
         ClaimGate::Withhold
@@ -1199,14 +1416,13 @@ async fn compute_idempotency_key(
         .ok()
 }
 
-/// Run the shared agent-dispatch guard over a freshly claimed item.
+/// Run the shared policy and approval guard over a freshly claimed item, for
+/// every node kind.
 ///
-/// An ADK agent compiles a whole turn's model-chosen tool calls into ONE
-/// `python_fn` / `java_fn` node, so the tool names are invisible to the ordinary
-/// node-kind policy path (review finding C1). The decision itself lives in
-/// `jamjet_worker::dispatch_guard` so this route and the in-process worker
-/// enforce the IDENTICAL policy; this function owns only the settle, which is
-/// transport-specific. Nothing here re-implements a policy rule — a second copy
+/// The decision lives in `jamjet_worker::node_guard::guard_item` (agent tool
+/// dispatch nodes are delegated from there to `dispatch_guard`), so this route
+/// and the in-process worker enforce the IDENTICAL policy; this function owns
+/// only the settle, which is transport-specific. Nothing here re-implements a policy rule — a second copy
 /// would drift, and a drifted copy of an enforcement rule is a hole.
 ///
 /// Enforcement is server-side on purpose: the external worker is untrusted, so
@@ -1256,8 +1472,17 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
             );
             return ClaimGate::Withhold;
         }
+        // No run to fail: settle the orphan item and withhold it.
         Ok(None) => {
-            return fail_closed(backend, wi, "execution not found".to_string()).await;
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                "claim: execution not found; withholding the payload"
+            );
+            return settle(
+                backend.fail_work_item(wi.id, "execution not found").await,
+                wi,
+            );
         }
         Ok(Some(e)) => e,
     };
@@ -1285,15 +1510,20 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
     if payload_disagrees("workflow_id", workflow_id)
         || payload_disagrees("workflow_version", workflow_version)
     {
-        return fail_closed(
-            backend,
-            wi,
-            format!(
-                "work item payload coordinates disagree with execution {workflow_id} \
-                 v{workflow_version}"
-            ),
-        )
-        .await;
+        // Only a hand-enqueued item can disagree with its execution, so this
+        // item is not the engine's: settle and withhold it, but do NOT fail the
+        // node, which would fail the legitimate run over a stray item.
+        let reason = format!(
+            "work item payload coordinates disagree with execution {workflow_id} \
+             v{workflow_version}"
+        );
+        warn!(
+            execution_id = %wi.execution_id,
+            node_id = %wi.node_id,
+            %reason,
+            "claim: withholding a work item that is not the engine's"
+        );
+        return settle(backend.fail_work_item(wi.id, &reason).await, wi);
     }
 
     let ir_value = match backend.get_workflow(workflow_id, workflow_version).await {
@@ -1368,85 +1598,66 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
         },
     };
 
-    // NARROWNESS. This route serves every queue. Everything that is not an agent
-    // tool dispatch — every model node, tool node, condition, ordinary python_fn
-    // — leaves here having had zero POLICY evaluation, and is returned exactly
-    // as before.
+    // EVERY node kind is evaluated here, on every queue. This route used to
+    // release everything but agent tool dispatch nodes with zero policy
+    // evaluation, so an approval-gated or blocked tool node claimed over HTTP
+    // ran unchecked, and the run's own initiator could use that to get past
+    // separation of duties (approval-integrity review, C1). The decision is
+    // `node_guard::guard_item`, the same function `Worker::execute_item` runs.
     //
-    // Not free, though: reaching this line already cost `get_execution`,
-    // `get_workflow` and a full `WorkflowIr` parse, and this is the hot path
-    // every external worker polls. Those lookups are what make the decision
-    // trustworthy — the execution record is the only engine-written answer to
-    // "which policy governs this item" — so they cannot simply move below this
-    // check. A `wi.queue_type` gate above them would skip the whole function for
-    // queues that can never hold a dispatch node, but it would also skip the
-    // coordinate tripwire and the execution-not-found fail-closed for those
-    // queues, which is a behaviour change and not one to make inside a security
-    // fix. Tracked in #116.
-    if !jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
-        return ClaimGate::Release;
-    }
+    // A dispatch node needs the whole graph parsed (its failure wording is the
+    // worker's); every other node needs only its own definition and the
+    // workflow-level policy, so the hot path still skips the full parse.
+    let (workflow_policy, node_def): (Option<jamjet_ir::workflow::PolicySetIr>, NodeDef) =
+        if jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
+            let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
+                Ok(ir) => ir,
+                Err(e) => {
+                    return fail_closed(backend, wi, format!("failed to load IR: {e}")).await;
+                }
+            };
+            let Some(node_def) = ir.node(&wi.node_id).cloned() else {
+                return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id))
+                    .await;
+            };
+            (ir.policy, node_def)
+        } else {
+            match guard_inputs_from_raw(&ir_value, &wi.node_id) {
+                Ok(inputs) => inputs,
+                Err(reason) => return fail_closed(backend, wi, reason).await,
+            }
+        };
 
-    // A dispatch node: now the whole graph is genuinely needed, because the
-    // policy chain `guard_dispatch` evaluates is workflow-wide.
-    let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
-        Ok(ir) => ir,
-        Err(e) => {
-            return fail_closed(backend, wi, format!("failed to load IR: {e}")).await;
-        }
-    };
-    let Some(node_def) = ir.node(&wi.node_id) else {
-        return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id)).await;
-    };
-
-    let input = jamjet_worker::dispatch_guard::payload_input(&wi.payload);
-    match jamjet_worker::dispatch_guard::guard_dispatch(
+    match jamjet_worker::node_guard::guard_item(
         backend,
+        jamjet_worker::node_guard::GuardMode::Fire,
         &wi.execution_id,
         &wi.node_id,
         &wi.tenant_id,
-        &ir,
-        node_def,
-        &input,
+        workflow_policy.as_ref(),
+        &node_def,
+        &wi.payload,
     )
     .await
     {
         DispatchGuardOutcome::Allow => ClaimGate::Release,
 
-        // The guard already recorded the `PolicyViolation`. Failing the item is
-        // what stops a blocked dispatch from being re-claimed forever: on a
-        // durable backend `fail_work_item` is terminal.
-        //
-        // KNOWN ASYMMETRY — this seam and the worker seam disagree on
-        // terminality, and this is the outcome of EVERY successful enforcement
-        // here, not an edge case.
-        //
-        // `SqliteBackend::fail_work_item` sets `status = 'failed'`
-        // unconditionally, so the reclaimer never returns the item and NOTHING
-        // emits `NodeFailed`. The execution therefore stays `Running` with the
-        // node still in the scheduler fold's `scheduled` set — it stalls rather
-        // than going terminal. `Worker::execute_item` does emit the terminal
-        // event, via the fenced `commit_turn`, so the same policy denial ends
-        // the execution on the in-process path and hangs it here.
-        //
-        // Safety is unaffected: the tool does not run and the denial is on the
-        // Prove surface either way. Closing the gap means emitting a
-        // fence-committed terminal event from the claim route, which is a
-        // scheduler-interaction change and is deliberately NOT done inside this
-        // security fix. It needs its own task.
+        // The guard already recorded the `PolicyViolation`. A block is a
+        // decision a retry cannot change, so the node fails for good: the item
+        // is settled and `NodeFailed { retryable: false }` appended in one
+        // fenced commit, exactly what the in-process worker records for the
+        // same block, and the scheduler fails the run on its next tick. (This
+        // arm used to settle the item as `failed` and emit nothing, which left
+        // the node in the fold's `scheduled` set and the run `Running`
+        // forever.)
         DispatchGuardOutcome::Blocked { reason } => {
             warn!(
                 execution_id = %wi.execution_id,
                 node_id = %wi.node_id,
                 %reason,
-                "claim: policy blocked an agent tool dispatch"
+                "claim: policy blocked this node"
             );
-            settle(
-                backend
-                    .fail_work_item(wi.id, &format!("policy blocked: {reason}"))
-                    .await,
-                wi,
-            )
+            fail_node(backend, wi, format!("policy blocked: {reason}")).await
         }
 
         // An outstanding `ToolApprovalRequired` exists for the node. Settle the
@@ -1464,7 +1675,7 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
                 execution_id = %wi.execution_id,
                 node_id = %wi.node_id,
                 gated = ?gated,
-                "claim: agent tool dispatch awaiting approval"
+                "claim: node awaiting approval"
             );
             match backend
                 .complete_work_item_fenced(wi.id, wi.lease_fence)
@@ -1491,10 +1702,86 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
                 execution_id = %wi.execution_id,
                 node_id = %wi.node_id,
                 %reason,
-                "claim: could not decide an agent tool dispatch; withholding the payload"
+                "claim: could not decide policy for this node; withholding the payload"
             );
             ClaimGate::Withhold
         }
+    }
+}
+
+/// The workflow-level policy and one node's definition, read from stored IR
+/// without deserializing the whole graph. `Err` carries the fail-closed reason.
+fn guard_inputs_from_raw(
+    ir_value: &Value,
+    node_id: &str,
+) -> Result<(Option<jamjet_ir::workflow::PolicySetIr>, NodeDef), String> {
+    let raw_node = ir_value
+        .get("nodes")
+        .and_then(|nodes| nodes.get(node_id))
+        .ok_or_else(|| format!("node {node_id} not found in IR"))?;
+    let node_def: NodeDef = serde_json::from_value(raw_node.clone())
+        .map_err(|e| format!("failed to load node definition: {e}"))?;
+    let workflow_policy = match ir_value.get("policy") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(
+            serde_json::from_value(raw.clone())
+                .map_err(|e| format!("failed to load workflow policy: {e}"))?,
+        ),
+    };
+    Ok((workflow_policy, node_def))
+}
+
+/// Whether a worker's result for `wi` may be recorded: the claim gate's
+/// decision in `GuardMode::Complete`. `Err` carries the status and reason.
+///
+/// Every input comes from engine-written records (the execution's workflow
+/// coordinates, the stored IR, the item as enqueued), never from the body.
+/// Unreadable state refuses with 503 rather than recording on a guess.
+async fn completion_gate(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+) -> Result<(), (StatusCode, String)> {
+    let unavailable = |e: String| (StatusCode::SERVICE_UNAVAILABLE, e);
+    let refused = |e: String| (StatusCode::CONFLICT, e);
+    let execution = backend
+        .get_execution(&wi.execution_id)
+        .await
+        .map_err(|e| unavailable(format!("execution unreadable: {e}")))?
+        .ok_or_else(|| refused("execution not found".to_string()))?;
+    let def = backend
+        .get_workflow(&execution.workflow_id, &execution.workflow_version)
+        .await
+        .map_err(|e| unavailable(format!("workflow unreadable: {e}")))?
+        .ok_or_else(|| {
+            refused(format!(
+                "workflow {} v{} not found",
+                execution.workflow_id, execution.workflow_version
+            ))
+        })?;
+    let (workflow_policy, node_def) =
+        guard_inputs_from_raw(&def.ir, &wi.node_id).map_err(refused)?;
+    match jamjet_worker::node_guard::guard_item(
+        backend,
+        jamjet_worker::node_guard::GuardMode::Complete,
+        &wi.execution_id,
+        &wi.node_id,
+        &wi.tenant_id,
+        workflow_policy.as_ref(),
+        &node_def,
+        &wi.payload,
+    )
+    .await
+    {
+        DispatchGuardOutcome::Allow => Ok(()),
+        DispatchGuardOutcome::Blocked { reason } => {
+            Err(refused(format!("policy blocked: {reason}")))
+        }
+        DispatchGuardOutcome::Held { .. } => Err(refused(
+            "node requires an approval that does not cover this occurrence; \
+             a result can be recorded only for an approved action"
+                .to_string(),
+        )),
+        DispatchGuardOutcome::Unavailable { reason } => Err(unavailable(reason)),
     }
 }
 
@@ -1515,7 +1802,48 @@ async fn fail_closed(
         %reason,
         "claim: cannot evaluate policy for this item; withholding the payload"
     );
-    settle(backend.fail_work_item(wi.id, &reason).await, wi)
+    fail_node(backend, wi, reason).await
+}
+
+/// Fail a withheld item's node for good: settle the item and append
+/// `NodeFailed { retryable: false }` in ONE fenced commit, so the scheduler
+/// fails the run instead of leaving it `Running` with the node still
+/// scheduled. For permanent refusals only (a policy block, an IR the engine
+/// cannot evaluate), never for an infrastructure error a retry could fix.
+///
+/// The payload is withheld whatever happens here. A lost fence means the item
+/// is not ours to settle; any other error leaves the lease to expire and the
+/// next claim decides again.
+async fn fail_node(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+    reason: String,
+) -> ClaimGate {
+    let terminal = jamjet_state::Event::new(
+        wi.execution_id.clone(),
+        0,
+        jamjet_state::EventKind::NodeFailed {
+            node_id: wi.node_id.clone(),
+            error: reason,
+            attempt: wi.attempt,
+            retryable: false,
+        },
+    );
+    match backend
+        .commit_turn_unless_terminal(wi.id, wi.lease_fence, terminal, false)
+        .await
+    {
+        Ok(_) => ClaimGate::Withhold,
+        Err(jamjet_state::StateBackendError::FenceLost(_)) => {
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                "claim: lease fence lost while failing a withheld work item"
+            );
+            ClaimGate::Withhold
+        }
+        Err(e) => settle(Err(e), wi),
+    }
 }
 
 /// Withhold regardless of whether the settle landed.
@@ -1583,6 +1911,7 @@ async fn complete_work_item(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
+    dev: Option<Extension<crate::auth::DevMode>>,
     Json(body): Json<CompleteWorkItemRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let item_id = Uuid::parse_str(&id)
@@ -1635,6 +1964,15 @@ async fn complete_work_item(
         }
     }
 
+    // The engine's own bookkeeping keys (`__budget`) are never a worker's to
+    // write. The budget enforcer reads them back, and the approval digest
+    // leaves them out as engine-written, so a reported value would be a budget
+    // reset and a change to later nodes' input that no approval covers.
+    let state_patch = jamjet_state::approvals::action_state(&body.state_patch);
+    if state_patch != body.state_patch {
+        warn!(work_item_id = %id, "complete: dropped engine bookkeeping keys from the reported state_patch");
+    }
+
     let node_completed = |execution_id: &ExecutionId, node_id: &str| {
         jamjet_state::Event::new(
             execution_id.clone(),
@@ -1644,7 +1982,7 @@ async fn complete_work_item(
             jamjet_state::EventKind::NodeCompleted {
                 node_id: node_id.to_string(),
                 output: body.output.clone(),
-                state_patch: body.state_patch.clone(),
+                state_patch: state_patch.clone(),
                 duration_ms: body.duration_ms,
                 gen_ai_system: body.gen_ai_system.clone(),
                 gen_ai_model: body.gen_ai_model.clone(),
@@ -1705,6 +2043,24 @@ async fn complete_work_item(
     // fence before it touches anything, so neither a retried completion of a
     // settled item nor a forged fence can settle an item (I1). The holder's
     // own item is withdrawn so an expiring lease cannot resurrect it.
+    // APPROVAL, at completion. The claim gate decides whether a node may FIRE;
+    // this decides whether a result for it may be RECORDED. Without it the
+    // legacy unfenced path below appends `NodeCompleted` for any item id, never
+    // claimed through the gate, and the scheduler then treats the gated node as
+    // having run (approval-integrity review, C1). The same rules as the claim
+    // gate (`node_guard::guard_item`), read-only: a gated node completes only
+    // under an approval for its current occurrence. No event is written on a
+    // refusal and the item is left alone.
+    if let Some(wi) = recorded.as_ref() {
+        if let Err((status, reason)) = completion_gate(backend.as_ref(), wi).await {
+            warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, %reason, "complete: refused");
+            return Ok((
+                status,
+                Json(json!({ "completed": false, "reason": reason })),
+            ));
+        }
+    }
+
     let committed_atomically = match (body.lease_fence, recorded.as_ref()) {
         (Some(fence), Some(wi)) => {
             let execution_id = wi.execution_id.clone();
@@ -1758,6 +2114,30 @@ async fn complete_work_item(
         // fence-guarded by construction, and without a fence we cannot show the
         // item is ours to settle.
         (None, _) => {
+            // A gated node's result needs the fence outside dev mode. Without
+            // one nothing shows this item went through the claim gate that
+            // checked the approval against its payload: the holder of any item
+            // id for an approved node could record a result after the input
+            // moved. The completion gate above has already refused a gated node
+            // with no approval for this occurrence, so a node that got here
+            // with any approval history was gated.
+            if dev.is_none() {
+                if let Some(wi) = recorded.as_ref() {
+                    let events = backend.get_events(&wi.execution_id).await?;
+                    if !matches!(
+                        jamjet_state::approvals::node_approval_status(&events, &wi.node_id),
+                        jamjet_state::approvals::NodeApprovalStatus::NotRequested
+                    ) {
+                        let reason = "an approval-gated node's result must echo the lease_fence \
+                                      from its claim";
+                        warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, "complete: refused, {reason}");
+                        return Ok((
+                            StatusCode::CONFLICT,
+                            Json(json!({ "completed": false, "reason": reason })),
+                        ));
+                    }
+                }
+            }
             // Without a fence nothing shows the item is the caller's, so a
             // terminal run's item is refused and left alone; its lease lapses
             // and the claim path settles it.
@@ -1807,7 +2187,7 @@ async fn complete_work_item(
         // those. Losing this write costs a stale convenience column, not state.
         if let Ok(Some(mut exec)) = backend.get_execution(&execution_id).await {
             if let Some(state_obj) = exec.current_state.as_object_mut() {
-                if let Some(patch_obj) = body.state_patch.as_object() {
+                if let Some(patch_obj) = state_patch.as_object() {
                     for (k, v) in patch_obj {
                         state_obj.insert(k.clone(), v.clone());
                     }
@@ -2275,6 +2655,33 @@ fn parse_execution_id(s: &str) -> Result<ExecutionId, ApiError> {
 }
 
 #[cfg(test)]
+mod tenant_scope_tests {
+    use super::*;
+
+    fn token(tenant: &str) -> jamjet_state::ApiToken {
+        jamjet_state::ApiToken {
+            id: "t1".into(),
+            name: "ops".into(),
+            role: "operator".into(),
+            created_at: Utc::now(),
+            expires_at: None,
+            tenant_id: tenant.into(),
+        }
+    }
+
+    /// The router puts a token in front of every tenant handler, so the
+    /// no-token arm is only reachable if that layer is ever lost. It must
+    /// refuse, not read as "unscoped".
+    #[test]
+    fn no_token_outside_dev_mode_is_refused() {
+        assert!(tenant_in_scope("default", None, None).is_err());
+        assert!(tenant_in_scope("default", None, Some(&crate::auth::DevMode)).is_ok());
+        assert!(tenant_in_scope("default", Some(&token("default")), None).is_ok());
+        assert!(tenant_in_scope("acme", Some(&token("default")), None).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
@@ -2283,6 +2690,85 @@ mod tests {
     use jamjet_state::InMemoryBackend;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    /// The approve handler records a caller-chosen `user_id` only on the
+    /// dev-mode router. Reached with neither a token nor the dev-mode marker
+    /// (an auth layer missing by misconfiguration), it refuses rather than
+    /// recording an unauthenticated approval under a name from the body.
+    #[tokio::test]
+    async fn approve_without_a_token_outside_dev_mode_is_refused() {
+        let state = tenant_routing_state();
+        let tenant = TenantId::default();
+        let backend = state.backend_for(&tenant);
+        let eid = ExecutionId::new();
+        // Started by someone, so separation of duties is not what refuses.
+        backend
+            .append_event(jamjet_state::Event::new(
+                eid.clone(),
+                1,
+                jamjet_state::EventKind::WorkflowStarted {
+                    workflow_id: "wf".into(),
+                    workflow_version: "0.1.0".into(),
+                    initial_input: json!({}),
+                    initiated_by: Some("token:someone".into()),
+                },
+            ))
+            .await
+            .unwrap();
+        backend
+            .append_event(jamjet_state::Event::new(
+                eid.clone(),
+                2,
+                jamjet_state::EventKind::ToolApprovalRequired {
+                    node_id: "gate".into(),
+                    tool_name: "t".into(),
+                    approver: "human".into(),
+                    context: json!({ "node_id": "gate" }),
+                },
+            ))
+            .await
+            .unwrap();
+        let body = || ApproveRequest {
+            decision: "approved".into(),
+            node_id: Some("gate".into()),
+            user_id: Some("mallory".into()),
+            comment: None,
+            state_patch: None,
+            action_digest: None,
+        };
+
+        let refused = approve_execution(
+            State(state.clone()),
+            Extension(tenant.clone()),
+            None,
+            None,
+            Path(eid.to_string()),
+            Json(body()),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(ApiError::Unauthorized)),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(
+            backend.get_events(&eid).await.unwrap().len(),
+            2,
+            "nothing appended"
+        );
+
+        // The dev-mode router's marker is what permits the body's name.
+        let accepted = approve_execution(
+            State(state),
+            Extension(tenant),
+            None,
+            Some(Extension(crate::auth::DevMode)),
+            Path(eid.to_string()),
+            Json(body()),
+        )
+        .await;
+        assert!(accepted.is_ok(), "{:?}", accepted.err());
+    }
 
     /// Build an `AppState` whose `backend_for` returns a DISTINCT in-memory
     /// backend per tenant id (created on first use). This lets a test prove the
@@ -2312,6 +2798,7 @@ mod tests {
             enricher,
             protocols: crate::state::default_protocol_registry(),
             cron_store: None,
+            approval_policy: Default::default(),
         }
     }
 
